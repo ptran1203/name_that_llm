@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+models/
+submission/*.parquet
+.venv/
+venv/
+
+# reference-only: someone else's public Kaggle notebook, kept locally for ideas
+local-candidate-adaptive-centered-stylegram.ipynb
