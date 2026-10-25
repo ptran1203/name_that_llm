@@ -14,7 +14,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold
 
-from paths import data_dir, models_dir
+from paths import data_dir
+from exp_log import ExperimentRun
 
 
 def build_vectorizers():
@@ -43,7 +44,7 @@ def fit_transform(texts, word_vec, char_vec, fit=True):
     return hstack([xw, xc]).tocsr()
 
 
-def cross_validate(df, n_splits=5, seed=0):
+def cross_validate(df, n_splits=5, log=print):
     gkf = GroupKFold(n_splits=n_splits)
     scores = []
     for fold, (train_idx, val_idx) in enumerate(
@@ -63,26 +64,28 @@ def cross_validate(df, n_splits=5, seed=0):
 
         score = balanced_accuracy_score(val_df["model"], preds)
         scores.append(score)
-        print(f"fold {fold}: balanced_accuracy={score:.4f}")
+        log(f"fold {fold}: balanced_accuracy={score:.4f}")
 
-    print(f"mean balanced_accuracy={np.mean(scores):.4f} +/- {np.std(scores):.4f}")
     return scores
 
 
-def fit_final(df):
+def fit_final(df, artifact_path, log=print):
     word_vec, char_vec = build_vectorizers()
     X = fit_transform(df["text"], word_vec, char_vec, fit=True)
     clf = LogisticRegression(max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1)
     clf.fit(X, df["model"])
-    model_path = models_dir() / "baseline.joblib"
-    joblib.dump({"word_vec": word_vec, "char_vec": char_vec, "clf": clf}, model_path)
-    print(f"saved final model to {model_path}")
+    joblib.dump({"word_vec": word_vec, "char_vec": char_vec, "clf": clf}, artifact_path)
+    log(f"saved final model to {artifact_path}")
 
 
 def main():
+    config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5}
+    run = ExperimentRun("tfidf_lr_baseline", config=config)
+
     df = pd.read_csv(data_dir() / "train.csv")
-    cross_validate(df)
-    fit_final(df)
+    scores = cross_validate(df, n_splits=config["n_splits"], log=run.log)
+    run.log_scores("balanced_accuracy", scores)
+    fit_final(df, run.artifact_path("baseline.joblib"), log=run.log)
 
 
 if __name__ == "__main__":

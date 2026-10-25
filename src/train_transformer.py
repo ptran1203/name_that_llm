@@ -19,9 +19,11 @@ from transformers import (
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
-from paths import data_dir, models_dir
+from paths import data_dir
+from exp_log import ExperimentRun
 
 
 class TextDataset(Dataset):
@@ -45,7 +47,31 @@ def compute_metrics(eval_pred):
     return {"balanced_accuracy": balanced_accuracy_score(labels, preds)}
 
 
-def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr):
+_NOISE_KEYS = {"eval_runtime", "eval_samples_per_second", "eval_steps_per_second"}
+
+
+def build_curve(log_history):
+    """Merges Trainer.state.log_history (separate train-step and eval entries) into one
+    row per epoch: {"epoch": ..., "train_loss": ..., "eval_loss": ..., "eval_balanced_accuracy": ...}."""
+    by_epoch = {}
+    for entry in log_history:
+        if "train_runtime" in entry:
+            continue  # final train() summary row, not a per-epoch point
+        epoch = round(entry.get("epoch", -1), 4)
+        row = by_epoch.setdefault(epoch, {"epoch": epoch})
+        if "loss" in entry:
+            row["train_loss"] = entry["loss"]
+        for k, v in entry.items():
+            if k.startswith("eval_") and k not in _NOISE_KEYS:
+                row[k] = v
+    return sorted(by_epoch.values(), key=lambda r: r["epoch"])
+
+
+def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42):
+    # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
+    # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
+    # is constructed afterward -- too late to control this init.
+    set_seed(seed)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=18)
     args = TrainingArguments(
         output_dir=out_dir,
@@ -57,10 +83,14 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         warmup_ratio=0.1,
         fp16=torch.cuda.is_available(),
         eval_strategy="epoch",
-        save_strategy="no",
-        logging_steps=50,
+        save_strategy="epoch",
+        save_total_limit=1,
+        load_best_model_at_end=True,
+        metric_for_best_model="balanced_accuracy",
+        greater_is_better=True,
+        logging_strategy="epoch",  # one train-loss point per epoch, aligned with eval_strategy="epoch"
         report_to="none",
-        seed=42,
+        seed=seed,
         dataloader_pin_memory=torch.cuda.is_available(),
     )
     collator = DataCollatorWithPadding(tokenizer)
@@ -78,13 +108,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_name", default="microsoft/deberta-v3-base")
     ap.add_argument("--max_length", type=int, default=384)
-    ap.add_argument("--epochs", type=float, default=15)
+    ap.add_argument("--epochs", type=float, default=10)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--n_splits", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_folds", type=int, default=None, help="only run first N folds (quick timing check)")
-    ap.add_argument("--fit_final", action="store_true", help="also fit on all data and save to models/")
+    ap.add_argument("--fit_final", action="store_true", help="also fit on all data and save as an artifact")
+    ap.add_argument("--run_name", default=None, help="defaults to the model name, slash-free")
     args = ap.parse_args()
+
+    run_name = args.run_name or args.model_name.replace("/", "_")
+    run = ExperimentRun(run_name, config=vars(args))
 
     df = pd.read_csv(data_dir() / "train.csv")
     labels_sorted = sorted(df["model"].unique())
@@ -110,35 +145,39 @@ def main():
 
         trainer = make_trainer(
             args.model_name, train_ds, val_ds, tokenizer,
-            out_dir=str(models_dir() / f"tmp_fold{fold}"), epochs=args.epochs, bs=args.batch_size, lr=args.lr,
+            out_dir=str(run.artifact_path(f"fold{fold}_ckpt")),
+            epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
         )
         trainer.train()
+        run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
         preds = trainer.predict(val_ds)
         pred_labels = np.argmax(preds.predictions, axis=-1)
         oof_pred[val_idx] = pred_labels
         score = balanced_accuracy_score(val_df["label"], pred_labels)
         fold_scores.append(score)
-        print(f"fold {fold}: balanced_accuracy={score:.4f}")
+        run.log(f"fold {fold}: balanced_accuracy={score:.4f}")
 
         del trainer
         torch.cuda.empty_cache()
 
-    print(f"mean balanced_accuracy={np.mean(fold_scores):.4f} +/- {np.std(fold_scores):.4f}")
+    run.log_scores("balanced_accuracy", fold_scores)
+    np.save(run.artifact_path("oof_pred.npy"), oof_pred)
 
     if args.fit_final:
-        out_dir = models_dir() / "transformer_final"
+        out_dir = run.artifact_path("final_model")
         full_ds = TextDataset(df["text"], df["label"].tolist(), tokenizer, args.max_length)
         trainer = make_trainer(
             args.model_name, full_ds, full_ds, tokenizer,
-            out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr,
+            out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
         )
         trainer.train()
+        run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)
         os.makedirs(out_dir, exist_ok=True)
         trainer.save_model(out_dir)
         tokenizer.save_pretrained(out_dir)
         import json
         json.dump(labels_sorted, open(out_dir / "labels.json", "w"))
-        print(f"saved final model to {out_dir}")
+        run.log(f"saved final model to {out_dir}")
 
 
 if __name__ == "__main__":
