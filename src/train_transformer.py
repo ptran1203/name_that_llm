@@ -6,6 +6,7 @@ model on all data for later inference / ensembling.
 """
 import argparse
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -67,12 +68,49 @@ def build_curve(log_history):
     return sorted(by_epoch.values(), key=lambda r: r["epoch"])
 
 
-def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42):
+def freeze_layers(model, unfreeze_last_n):
+    """Freezes embeddings + all encoder transformer layers except the last `unfreeze_last_n`;
+    pooler/classifier head always stays trainable. None = full fine-tune (no freezing).
+    Rationale: with ~2160 train rows/fold, full fine-tuning a 184M-param model visibly overfits
+    (train_loss << eval_loss within a few epochs). Freezing early layers -- which tend to carry
+    generic/syntactic features, not task-specific ones -- cuts trainable params and should
+    overfit less, at the cost of less task adaptation. Worth testing empirically, not assuming."""
+    if unfreeze_last_n is None:
+        return None, None
+    layer_re = re.compile(r"encoder\.layer\.(\d+)\.")
+    max_layer = max(
+        (int(m.group(1)) for name, _ in model.named_parameters() if (m := layer_re.search(name))),
+        default=None,
+    )
+    assert max_layer is not None, "could not find 'encoder.layer.<i>.' params to freeze"
+    cutoff = max_layer - unfreeze_last_n + 1
+
+    trainable, frozen = 0, 0
+    for name, param in model.named_parameters():
+        m = layer_re.search(name)
+        if m:
+            param.requires_grad = int(m.group(1)) >= cutoff
+        elif "embeddings" in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True  # pooler, classifier, any layers outside the numbered stack
+        if param.requires_grad:
+            trainable += param.numel()
+        else:
+            frozen += param.numel()
+    return trainable, frozen
+
+
+def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42, unfreeze_last_n=None):
     # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
     # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
     # is constructed afterward -- too late to control this init.
     set_seed(seed)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=18)
+    trainable, frozen = freeze_layers(model, unfreeze_last_n)
+    if trainable is not None:
+        print(f"unfreeze_last_n={unfreeze_last_n}: trainable={trainable:,} frozen={frozen:,} "
+              f"({100 * trainable / (trainable + frozen):.1f}% trainable)")
     args = TrainingArguments(
         output_dir=out_dir,
         per_device_train_batch_size=bs,
@@ -116,6 +154,8 @@ def main():
     ap.add_argument("--max_folds", type=int, default=None, help="only run first N folds (quick timing check)")
     ap.add_argument("--fit_final", action="store_true", help="also fit on all data and save as an artifact")
     ap.add_argument("--run_name", default=None, help="defaults to the model name, slash-free")
+    ap.add_argument("--unfreeze_last_n", type=int, default=None,
+                     help="only fine-tune the last N encoder layers + head; default None = full fine-tune")
     args = ap.parse_args()
 
     run_name = args.run_name or args.model_name.replace("/", "_")
@@ -147,6 +187,7 @@ def main():
             args.model_name, train_ds, val_ds, tokenizer,
             out_dir=str(run.artifact_path(f"fold{fold}_ckpt")),
             epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
+            unfreeze_last_n=args.unfreeze_last_n,
         )
         trainer.train()
         run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
@@ -169,6 +210,7 @@ def main():
         trainer = make_trainer(
             args.model_name, full_ds, full_ds, tokenizer,
             out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
+            unfreeze_last_n=args.unfreeze_last_n,
         )
         trainer.train()
         run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)
