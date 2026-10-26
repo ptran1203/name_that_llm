@@ -10,5 +10,6 @@ kaggle_code_package/
 .venv/
 venv/
 
-# reference-only: someone else's public Kaggle notebook, kept locally for ideas
+# reference-only: someone else's public Kaggle notebooks, kept locally for ideas
 local-candidate-adaptive-centered-stylegram.ipynb
+0-641-lora-llama-qwen3-8-27b.ipynb

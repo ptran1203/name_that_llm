@@ -5,6 +5,7 @@ Saves per-fold OOF predictions and prints mean balanced accuracy. Optionally fit
 model on all data for later inference / ensembling.
 """
 import argparse
+import inspect
 import os
 import re
 
@@ -101,6 +102,35 @@ def freeze_layers(model, unfreeze_last_n):
     return trainable, frozen
 
 
+_CRITICAL_ARGS = {"eval_strategy", "evaluation_strategy", "save_strategy", "load_best_model_at_end",
+                   "metric_for_best_model", "greater_is_better"}
+_RENAMES = {"eval_strategy": "evaluation_strategy"}  # older transformers used the longer name
+
+
+def build_training_args(wanted):
+    """Builds TrainingArguments from `wanted`, filtered to whatever this installed transformers
+    version actually supports. Different environments (local/Kaggle/Colab) can have meaningfully
+    different transformers versions, and a hard crash on one unsupported kwarg (e.g. a renamed
+    scheduler option) shouldn't take down the whole run. Loudly warns if anything load-bearing
+    for correctness (best-checkpoint selection) gets dropped instead of silently losing it."""
+    supported = set(inspect.signature(TrainingArguments.__init__).parameters)
+    kwargs = {}
+    dropped = []
+    for key, value in wanted.items():
+        if key in supported:
+            kwargs[key] = value
+        elif key in _RENAMES and _RENAMES[key] in supported:
+            kwargs[_RENAMES[key]] = value
+        else:
+            dropped.append(key)
+    if dropped:
+        bad = _CRITICAL_ARGS & set(dropped)
+        print(f"TrainingArguments on this transformers version doesn't support: {dropped} -- dropping them.")
+        if bad:
+            print(f"WARNING: dropped args affecting correctness (best-checkpoint selection): {bad}")
+    return TrainingArguments(**kwargs)
+
+
 def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42, unfreeze_last_n=None):
     # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
     # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
@@ -111,7 +141,8 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
     if trainable is not None:
         print(f"unfreeze_last_n={unfreeze_last_n}: trainable={trainable:,} frozen={frozen:,} "
               f"({100 * trainable / (trainable + frozen):.1f}% trainable)")
-    args = TrainingArguments(
+
+    wanted = dict(
         output_dir=out_dir,
         per_device_train_batch_size=bs,
         per_device_eval_batch_size=bs * 2,
@@ -131,6 +162,7 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         seed=seed,
         dataloader_pin_memory=torch.cuda.is_available(),
     )
+    args = build_training_args(wanted)
     collator = DataCollatorWithPadding(tokenizer)
     return Trainer(
         model=model,
