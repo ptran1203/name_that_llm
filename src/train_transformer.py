@@ -131,7 +131,8 @@ def build_training_args(wanted):
     return TrainingArguments(**kwargs)
 
 
-def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42, unfreeze_last_n=None):
+def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42,
+                  unfreeze_last_n=None, precision="fp16"):
     # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
     # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
     # is constructed afterward -- too late to control this init.
@@ -150,7 +151,8 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         learning_rate=lr,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        fp16=torch.cuda.is_available(),
+        fp16=(precision == "fp16" and torch.cuda.is_available()),
+        bf16=(precision == "bf16" and torch.cuda.is_available()),
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
@@ -188,6 +190,9 @@ def main():
     ap.add_argument("--run_name", default=None, help="defaults to the model name, slash-free")
     ap.add_argument("--unfreeze_last_n", type=int, default=None,
                      help="only fine-tune the last N encoder layers + head; default None = full fine-tune")
+    ap.add_argument("--precision", default="fp16", choices=["fp32", "fp16", "bf16"],
+                     help="fp32 sidesteps GradScaler issues (e.g. on environments that load the "
+                          "model itself in fp16, which breaks fp16 mixed-precision training)")
     args = ap.parse_args()
 
     run_name = args.run_name or args.model_name.replace("/", "_")
@@ -219,7 +224,7 @@ def main():
             args.model_name, train_ds, val_ds, tokenizer,
             out_dir=str(run.artifact_path(f"fold{fold}_ckpt")),
             epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
-            unfreeze_last_n=args.unfreeze_last_n,
+            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision,
         )
         trainer.train()
         run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
@@ -242,7 +247,7 @@ def main():
         trainer = make_trainer(
             args.model_name, full_ds, full_ds, tokenizer,
             out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
-            unfreeze_last_n=args.unfreeze_last_n,
+            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision,
         )
         trainer.train()
         run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)
