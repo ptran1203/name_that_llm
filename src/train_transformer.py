@@ -132,7 +132,7 @@ def build_training_args(wanted):
 
 
 def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42,
-                  unfreeze_last_n=None, precision="fp16"):
+                  unfreeze_last_n=None, precision="fp16", max_steps=None):
     # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
     # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
     # is constructed afterward -- too late to control this init.
@@ -143,26 +143,48 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         print(f"unfreeze_last_n={unfreeze_last_n}: trainable={trainable:,} frozen={frozen:,} "
               f"({100 * trainable / (trainable + frozen):.1f}% trainable)")
 
+    if precision == "fp16":
+        # Diagnostic for the known Kaggle (transformers 5.x) crash: "Attempting to unscale FP16
+        # gradients" during grad-clipping. Expected/correct state for autocast-based fp16 mixed
+        # precision is fp32 master weights; if from_pretrained() itself produced fp16 weights,
+        # that's the actual bug, and this will say so immediately instead of failing opaquely
+        # mid-training (and only on whichever rank/step happens to print first under DDP).
+        model_dtype = next(model.parameters()).dtype
+        if model_dtype != torch.float32:
+            print(f"WARNING: model loaded as {model_dtype}, not float32 -- fp16 mixed precision "
+                  f"expects fp32 master weights and will likely crash with 'Attempting to unscale "
+                  f"FP16 gradients' during grad-clipping. This confirms from_pretrained() itself is "
+                  f"producing non-fp32 weights on this environment, not an autocast config issue.")
+
+    # max_steps: for smoke/correctness tests -- train.py's --max_steps overrides epoch-based
+    # training entirely, so e.g. --max_steps 1 --batch_size 2 runs exactly one batch, not a full
+    # epoch's worth of steps (epochs=1 still means ~270 steps on the full fold, not "one batch").
+    eval_save_kwargs = (
+        dict(eval_strategy="steps", eval_steps=max_steps, save_strategy="steps", save_steps=max_steps)
+        if max_steps else
+        dict(eval_strategy="epoch", save_strategy="epoch")
+    )
     wanted = dict(
         output_dir=out_dir,
         per_device_train_batch_size=bs,
         per_device_eval_batch_size=bs * 2,
         num_train_epochs=epochs,
+        max_steps=max_steps if max_steps else -1,
         learning_rate=lr,
         weight_decay=0.01,
         warmup_ratio=0.1,
         fp16=(precision == "fp16" and torch.cuda.is_available()),
         bf16=(precision == "bf16" and torch.cuda.is_available()),
-        eval_strategy="epoch",
-        save_strategy="epoch",
         save_total_limit=1,
         load_best_model_at_end=True,
         metric_for_best_model="balanced_accuracy",
         greater_is_better=True,
-        logging_strategy="epoch",  # one train-loss point per epoch, aligned with eval_strategy="epoch"
+        logging_strategy="steps" if max_steps else "epoch",
+        logging_steps=max_steps if max_steps else 500,
         report_to="none",
         seed=seed,
         dataloader_pin_memory=torch.cuda.is_available(),
+        **eval_save_kwargs,
     )
     args = build_training_args(wanted)
     collator = DataCollatorWithPadding(tokenizer)
@@ -181,6 +203,8 @@ def main():
     ap.add_argument("--model_name", default="microsoft/deberta-v3-base")
     ap.add_argument("--max_length", type=int, default=384)
     ap.add_argument("--epochs", type=float, default=10)
+    ap.add_argument("--max_steps", type=int, default=None,
+                     help="overrides --epochs; for smoke tests, e.g. --max_steps 1 --batch_size 2")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--n_splits", type=int, default=5)
@@ -190,9 +214,12 @@ def main():
     ap.add_argument("--run_name", default=None, help="defaults to the model name, slash-free")
     ap.add_argument("--unfreeze_last_n", type=int, default=None,
                      help="only fine-tune the last N encoder layers + head; default None = full fine-tune")
-    ap.add_argument("--precision", default="fp16", choices=["fp32", "fp16", "bf16"],
-                     help="fp32 sidesteps GradScaler issues (e.g. on environments that load the "
-                          "model itself in fp16, which breaks fp16 mixed-precision training)")
+    ap.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"],
+                     help="default fp32: confirmed working on Kaggle (transformers 5.x), where "
+                          "fp16 hits 'Attempting to unscale FP16 gradients' during grad-clipping. "
+                          "Root cause not fully pinned down (needs live CUDA debugging I can't do "
+                          "locally); fp32 is slower but reliable. Pass fp16 explicitly if your "
+                          "environment is confirmed to support it (e.g. matches transformers 4.57.6).")
     args = ap.parse_args()
 
     run_name = args.run_name or args.model_name.replace("/", "_")
@@ -224,7 +251,7 @@ def main():
             args.model_name, train_ds, val_ds, tokenizer,
             out_dir=str(run.artifact_path(f"fold{fold}_ckpt")),
             epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
-            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision,
+            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
         )
         trainer.train()
         run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
@@ -247,7 +274,7 @@ def main():
         trainer = make_trainer(
             args.model_name, full_ds, full_ds, tokenizer,
             out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
-            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision,
+            unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
         )
         trainer.train()
         run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)

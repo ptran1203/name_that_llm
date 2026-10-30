@@ -5,9 +5,11 @@ models/
 experiments/
 submission/*.parquet
 data/test.csv
+data/external/
 kaggle_package/
 kaggle_code_package/
 .venv/
+.venv*/
 venv/
 
 # reference-only: someone else's public Kaggle notebooks, kept locally for ideas
