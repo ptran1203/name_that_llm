@@ -77,16 +77,16 @@ theory on why (the gates likely inherit the same p>>n overfitting as the base cl
   classify by majority vote among nearest training neighbors, instead of / blended with a
   parametric classifier. Simple; embedding-space locality might capture style once topic is
   controlled for.
-- **Exploit the paired-prompt structure via retrieval** (priority candidate): train is ~18
-  responses to each of 150 shared prompts (confirmed in notebooks/eda.ipynb). If the hidden
-  test set has the same structure, similarity search could detect which test rows share an
-  unseen prompt by content similarity, then treat prediction as a **constrained assignment
-  problem** — since each model answers a given prompt at most once, no two passages in the
-  same detected cluster should get the same predicted label. Enforce with the Hungarian
-  algorithm over the cluster's prediction probabilities. Stronger than the downloaded
-  reference notebook's soft "topic clustering" trick since it's an actual hard constraint
-  from a confirmed property of the dataset, not a heuristic. Needs checking test.csv for the
-  same pairing structure before betting on it.
+- **Exploit the paired-prompt structure via retrieval** — ~~priority candidate~~ **downgraded,
+  see below**: train is ~18 responses to each of 150 shared prompts (confirmed in
+  notebooks/eda.ipynb). The idea was: if hidden test has the same structure, similarity search
+  could detect which test rows share an unseen prompt, then treat prediction as a **constrained
+  assignment problem** (Hungarian algorithm) since each model answers a given prompt at most
+  once. README confirms this assumption is false for test: "the number of test passages per
+  model is not equal, and the mix of models differs between the public and private
+  leaderboard" -- contradicts the clean "every model answers every prompt exactly once"
+  structure this depended on. The hard-constraint version is very likely not viable; the
+  near-duplicate-detection safety net (last bullet below) is unaffected by this and still fine.
 - **Free safety net**: similarity search between train and the hidden test set for
   near-duplicates (quote reuse, accidental leakage). Cheap, zero downside, unlikely to hit
   but free correct labels if it ever does.

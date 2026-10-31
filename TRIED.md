@@ -107,3 +107,19 @@ train this script single-GPU on Kaggle** (`CUDA_VISIBLE_DEVICES=0`) -- a runtime
 `train_transformer.py` now fires if `torch.cuda.device_count() > 1`. Partial fine-tuning
 (`--unfreeze_last_n`) is fast enough single-GPU that the multi-GPU speedup isn't worth chasing
 these bugs further right now.
+
+## Post-hoc per-class logit-bias calibration (balance the predicted marginal)
+
+On the best banked model (fusion_lgbm, 0.3482 CV, official-only balanced training data): its OOF
+predicted-label counts range from 107 (claude-fable-5) to 196 (qwen3.8-max) despite training on an
+exactly-balanced 150/class dataset -- looked like exploitable model bias. Fit a per-class additive
+log-proba bias via iterative adjustment (push over-predicted classes' bias down, under-predicted
+up) until the predicted marginal matched the true 150/class uniform exactly. Result: balanced
+accuracy went *down* slightly, 0.3482 -> 0.3441. Reason: balanced accuracy = mean of per-class
+recall, each normalized by that class's own *true* count, not by how often the model predicts it
+-- a model legitimately over-predicting an "easy" class costs nothing on its own, so forcing the
+marginal to match 150/class just suppresses some genuinely-correct confident predictions to make
+quota room, which costs more than the forced balance gains. This only has a chance of helping when
+the *training* distribution itself is skewed (e.g. once external data -- whose per-class counts
+are genuinely uneven -- gets blended into a fine-tune); not useful on an already-balanced-trained
+model. Not wired into predict.py.
