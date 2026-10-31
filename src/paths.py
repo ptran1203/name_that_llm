@@ -42,3 +42,23 @@ def external_data_dir():
     raise FileNotFoundError(
         "external data dir not found. Looked in: " + ", ".join(str(p) for p in _EXTERNAL_DATA_DIR_CANDIDATES)
     )
+
+
+_EXTERNAL_POOL_CANDIDATES = [
+    _REPO_ROOT / "data/external/ntl_open_pool.parquet",
+    pathlib.Path("/kaggle/input/datasets/crtproduction/name-that-llm-open-pool/ntl_open_pool.parquet"),
+    pathlib.Path("/kaggle/input/name-that-llm-open-pool/ntl_open_pool.parquet"),
+]
+
+
+def external_pool_path():
+    """The big pooled-from-many-sources external dataset (226k rows, quality flags + n_sources).
+    Needs its own flag-filtering/capping before use -- see train_transformer.py's
+    load_external_pool() or the frozen_embeddings notebook -- unlike the smaller pre-cleaned
+    prvsiyan/darragh1walsh sources external_data_dir() resolves."""
+    for p in _EXTERNAL_POOL_CANDIDATES:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "ntl_open_pool.parquet not found. Looked in: " + ", ".join(str(p) for p in _EXTERNAL_POOL_CANDIDATES)
+    )

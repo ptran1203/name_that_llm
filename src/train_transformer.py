@@ -25,7 +25,7 @@ from transformers import (
     set_seed,
 )
 
-from paths import data_dir, external_data_dir
+from paths import data_dir, external_data_dir, external_pool_path
 from exp_log import ExperimentRun
 
 # Mirrors analyze_errors.py's FAMILY_PREFIXES -- kept duplicated (not imported) so this module
@@ -38,6 +38,20 @@ def family_of(label):
         if label.startswith(p):
             return p
     return label
+
+
+def load_external_pool(cap_per_class, label2id):
+    """ntl_open_pool.parquet (226k rows, pooled from many public Kaggle datasets): drop rows
+    flagged near-duplicate to official train prompts, regenerated, or at risk of Gemini-3.7
+    API routing mislabeling, then cap per class prioritized by n_sources (how many independent
+    public datasets agree on this row). Mirrors the frozen_embeddings notebook's loading cell."""
+    pool = pd.read_parquet(external_pool_path())
+    pool = pool[~pool["flag_near_train_prompt"] & ~pool["flag_train_prompt_regen"]
+                & ~pool["flag_gemini37_routing_risk"]].copy()
+    pool = pool[pool["model"].isin(label2id)]
+    pool = pool.sort_values("n_sources", ascending=False)
+    pool = pool.groupby("model", group_keys=False).head(cap_per_class)
+    return pool[["text", "model"]].reset_index(drop=True)
 
 
 class TextDataset(Dataset):
@@ -299,6 +313,14 @@ def main():
                           "notebook); not done here.")
     ap.add_argument("--external_weight", type=float, default=0.25,
                      help="sample_weight for external rows relative to official rows (1.0)")
+    ap.add_argument("--external_pool_cap_per_class", type=int, default=None,
+                     help="if set, also loads ntl_open_pool.parquet (flag-filtered, capped per "
+                          "class, prioritized by n_sources) as a third external source, resolved "
+                          "via paths.external_pool_path() (local data/external/, or the Kaggle "
+                          "crtproduction/name-that-llm-open-pool dataset once attached). None = "
+                          "don't use it (matches your last notebook run, which deliberately "
+                          "excluded it). Try e.g. 1000 -- untested in this script, quick-check with "
+                          "--max_folds 1 first.")
     ap.add_argument("--label_smoothing", type=float, default=0.1)
     ap.add_argument("--family_aux_weight", type=float, default=0.0,
                      help="weight of the family-level auxiliary loss (0 = off). Marginalizes the "
@@ -332,9 +354,8 @@ def main():
             return str(candidate)
         raise FileNotFoundError(f"external data file not found: {p!r} (also tried {candidate})")
 
-    ext_df = None
+    ext_frames = []
     if args.external_paths:
-        frames = []
         for p in args.external_paths.split(","):
             resolved = resolve_external_path(p)
             run.log(f"external data: loading {resolved}")
@@ -343,12 +364,19 @@ def main():
             edf = edf[edf["model"].isin(label2id)].copy()
             if len(edf) < before:
                 run.log(f"{p}: dropped {before - len(edf)} rows with unknown model labels")
-            frames.append(edf[["text", "model"]])
-        ext_df = pd.concat(frames, ignore_index=True)
+            ext_frames.append(edf[["text", "model"]])
+    if args.external_pool_cap_per_class is not None:
+        pool_df = load_external_pool(args.external_pool_cap_per_class, label2id)
+        run.log(f"external pool: loaded {len(pool_df)} rows (cap={args.external_pool_cap_per_class}/class)")
+        ext_frames.append(pool_df)
+
+    ext_df = None
+    if ext_frames:
+        ext_df = pd.concat(ext_frames, ignore_index=True)
         ext_df["label"] = ext_df["model"].map(label2id)
         ext_df["family_label"] = ext_df["label"].map(lambda i: family2id[family_of(labels_sorted[i])])
         ext_df["sample_weight"] = args.external_weight
-        run.log(f"external data: {len(ext_df)} rows, weight={args.external_weight}")
+        run.log(f"external data total: {len(ext_df)} rows, weight={args.external_weight}")
         run.log(f"external by model:\n{ext_df['model'].value_counts()}")
 
     # DeBERTa-v3's sentencepiece tokenizer has a known fast-tokenizer conversion bug (byte-fallback
