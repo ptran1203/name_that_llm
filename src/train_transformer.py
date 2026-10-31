@@ -189,9 +189,17 @@ class MultiTaskTrainer(Trainer):
         per_example = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing, reduction="none")
 
         if self.family_aux_weight > 0 and family_label is not None and self.family_matrix is not None:
-            probs = F.softmax(logits, dim=-1)
-            family_probs = probs @ self.family_matrix.to(device=probs.device, dtype=probs.dtype)
-            family_loss = F.nll_loss(torch.log(family_probs.clamp_min(1e-8)), family_label, reduction="none")
+            # log P(family) = logsumexp(logits over that family's labels) - logsumexp(all logits).
+            # Numerically stable (no softmax -> matmul -> log(small number), which blew up to
+            # -inf/nan grad_norm once the model got confidently wrong about family -- see the
+            # NaN run this replaced).
+            fm = self.family_matrix.to(device=logits.device, dtype=torch.bool)  # [num_labels, n_fam]
+            neg_inf = torch.finfo(logits.dtype).min
+            masked = torch.where(fm.T.unsqueeze(0), logits.unsqueeze(1), neg_inf)  # [B, n_fam, num_labels]
+            family_logsumexp = torch.logsumexp(masked, dim=-1)  # [B, n_fam]
+            total_logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)  # [B, 1]
+            family_log_probs = family_logsumexp - total_logsumexp
+            family_loss = F.nll_loss(family_log_probs, family_label, reduction="none")
             per_example = per_example + self.family_aux_weight * family_loss
 
         if sample_weight is not None:
