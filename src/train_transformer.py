@@ -25,7 +25,7 @@ from transformers import (
     set_seed,
 )
 
-from paths import data_dir
+from paths import data_dir, external_data_dir
 from exp_log import ExperimentRun
 
 # Mirrors analyze_errors.py's FAMILY_PREFIXES -- kept duplicated (not imported) so this module
@@ -287,13 +287,16 @@ def main():
                           "locally); fp32 is slower but reliable. Pass fp16 explicitly if your "
                           "environment is confirmed to support it (e.g. matches transformers 4.57.6).")
     ap.add_argument("--external_paths", default=None,
-                     help="comma-separated parquet paths (schema: text, model[, prompt_id, "
-                          "source_dataset] -- matches src/prepare_external_data.py's output, e.g. "
-                          "data/external/prvsiyan.parquet,data/external/darragh1walsh.parquet). "
-                          "Rows always join the TRAIN side of every fold, never val -- CV stays an "
-                          "honest estimate on official data only. ntl_open_pool.parquet needs its "
-                          "own flag-filtering/capping first (see the frozen_embeddings notebook); "
-                          "not done here.")
+                     help="comma-separated parquet filenames (schema: text, model[, prompt_id, "
+                          "source_dataset] -- matches src/prepare_external_data.py's output), e.g. "
+                          "prvsiyan.parquet,darragh1walsh.parquet. A bare filename resolves via "
+                          "paths.external_data_dir() (local data/external/, or Kaggle dataset "
+                          "/kaggle/input/name-that-llm-external-data/ once attached -- see "
+                          "scripts/update_external_data.bat); a path that exists as given is used "
+                          "as-is. Rows always join the TRAIN side of every fold, never val -- CV "
+                          "stays an honest estimate on official data only. ntl_open_pool.parquet "
+                          "needs its own flag-filtering/capping first (see the frozen_embeddings "
+                          "notebook); not done here.")
     ap.add_argument("--external_weight", type=float, default=0.25,
                      help="sample_weight for external rows relative to official rows (1.0)")
     ap.add_argument("--label_smoothing", type=float, default=0.1)
@@ -320,11 +323,22 @@ def main():
     df["family_label"] = df["label"].map(lambda i: family2id[family_of(labels_sorted[i])])
     run.log(f"families: {family2id}")
 
+    def resolve_external_path(p):
+        p = p.strip()
+        if os.path.exists(p):
+            return p
+        candidate = external_data_dir() / os.path.basename(p)
+        if candidate.exists():
+            return str(candidate)
+        raise FileNotFoundError(f"external data file not found: {p!r} (also tried {candidate})")
+
     ext_df = None
     if args.external_paths:
         frames = []
         for p in args.external_paths.split(","):
-            edf = pd.read_parquet(p.strip())
+            resolved = resolve_external_path(p)
+            run.log(f"external data: loading {resolved}")
+            edf = pd.read_parquet(resolved)
             before = len(edf)
             edf = edf[edf["model"].isin(label2id)].copy()
             if len(edf) < before:
