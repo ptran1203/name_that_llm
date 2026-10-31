@@ -68,3 +68,20 @@ reference data helps," but even the best variant isn't remotely competitive. Per
 in IDEAS.md #6, Step 1 was meant to gate whether Step 2 (a learned pairwise verifier with
 deliberate hard-negative sampling) is worth building -- this result says **no**, raw embedding
 similarity doesn't carry enough same/different-model signal on its own. Step 2 not attempted.
+
+## Label smoothing (0.1) in train_transformer.py, on Kaggle
+
+`train_transformer.py`'s custom loss. `--label_smoothing 0.1` + `--unfreeze_last_n 1` (fp32,
+single-GPU, confirmed via `CUDA_VISIBLE_DEVICES=0`, no external data or `family_aux_weight`
+needed to reproduce) hit a NaN gradient explosion by epoch 2 on Kaggle: `grad_norm: nan`,
+`loss: 0`, then `eval_loss: nan` / `eval_balanced_accuracy: 0.05556` (== 1/18 -- every prediction
+had already collapsed to one constant class, i.e. the weights were NaN before eval even ran).
+Same config with `--label_smoothing 0` (everything else identical) trained clean. Same command
+reportedly fine on the user's local machine too, so this looks like an environment-specific
+(Kaggle fp32, this transformers/torch version, or the `unfreeze_last_n=1`-sized trainable set
+specifically) interaction, not a universal label-smoothing bug -- but since label smoothing is
+normally a *stabilizer*, not a destabilizer, the mechanism is genuinely unclear and wasn't root-
+caused (ruled out along the way: DDP -- reproduces single-GPU too; the family-aux loss's
+clamp+log formulation -- reproduces with `family_aux_weight=0`; external data -- reproduces
+without it). Default changed to `--label_smoothing 0` (off); re-enable only with a `--max_folds 1`
+quick-check on the actual target environment first.

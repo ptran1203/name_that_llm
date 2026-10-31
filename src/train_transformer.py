@@ -329,7 +329,12 @@ def main():
                           "don't use it (matches your last notebook run, which deliberately "
                           "excluded it). Try e.g. 1000 -- untested in this script, quick-check with "
                           "--max_folds 1 first.")
-    ap.add_argument("--label_smoothing", type=float, default=0.1)
+    ap.add_argument("--label_smoothing", type=float, default=0.0,
+                     help="default 0 (off): confirmed to cause a NaN gradient explosion by epoch "
+                          "2 with unfreeze_last_n=1 on Kaggle (fp32, single-GPU, no external data "
+                          "or family_aux_weight needed to reproduce -- label_smoothing=0 with the "
+                          "same everything-else trains clean). Root cause not pinned down; opt in "
+                          "and quick-check with --max_folds 1 before trusting it.")
     ap.add_argument("--family_aux_weight", type=float, default=0.0,
                      help="weight of the family-level auxiliary loss (0 = off). Marginalizes the "
                           "18-way softmax into FAMILY_PREFIXES groups; targets cross-family "
