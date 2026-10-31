@@ -17,6 +17,9 @@ model (so the label stays valid), to cheaply grow the effective dataset beyond 1
 - Validate with the existing GroupKFold-by-prompt_id CV before trusting any gain — augmentation
   that only helps train-loss but not held-out balanced accuracy isn't worth the complexity.
 
+> **TRIED — negative, see TRIED.md.** Feature-space mixup on TF-IDF tested at two multipliers,
+> both below the plain baseline. Text-level splicing never implemented.
+
 ## 2. Stack a fine-tuned encoder (RoBERTa/DeBERTa) with TF-IDF for ensembling
 
 (Note: RoBERTa/DeBERTa are encoder-only, not decoder — worth keeping straight since decoder-only
@@ -33,6 +36,12 @@ Two ways to combine them:
   more prone to overfitting the concatenated space than two independent models blended after.
 - Recommendation if/when we get here: start with the model-level blend, it's what's already
   validated by prior public solutions on this exact problem.
+
+> **Feature-level fusion variant TRIED — succeeded.** `train_fusion_lgbm.py`: fine-tuned
+> DeBERTa embedding + SVD-compressed TF-IDF + stylometric -> LightGBM. 0.3482 CV / 0.353 LB,
+> our best result overall. The "riskier" option here actually won — key difference from the
+> plain concatenation that failed later (see idea 1's TRIED note and TRIED.md) is the TF-IDF
+> side was SVD-compressed first, not fed in raw/sparse. Model-level blend still untried.
 
 ## 3. Few-shot / in-context classification at inference time
 
@@ -53,9 +62,14 @@ instead of a trained classifier head.
   models.
 
 
-## 4 Mixture of experts
-1. first classify the provider
-2. each provider have they own models
+## 4. Mixture of experts — TRIED, see TRIED.md
+
+~~1. first classify the provider~~
+~~2. each provider have they own models~~
+
+Implemented as a soft family-gate (base classifier + per-family re-ranker), not a hard
+provider-then-model cascade. No CV improvement observed — see TRIED.md for the result and a
+theory on why (the gates likely inherit the same p>>n overfitting as the base classifier).
 
 ## 5. Similarity search
 
@@ -76,3 +90,40 @@ instead of a trained classifier head.
 - **Free safety net**: similarity search between train and the hidden test set for
   near-duplicates (quote reuse, accidental leakage). Cheap, zero downside, unlikely to hit
   but free correct labels if it ever does.
+
+## 6. Few-shot / metric-learning: pairwise same-model verification
+
+Instead of direct 18-way softmax classification, reframe as "do these two passages have the
+same author?" (binary verification), then classify a new passage by comparing it against a
+small stored reference set per model (e.g. 5 reference passages/model = a 90-passage
+"database") and predicting whichever model's references it matches best. This is standard
+few-shot metric learning (prototypical-networks style), not a new idea invented here, but
+untried on this problem so far.
+
+- **Why it could help with so little data**: pairwise framing turns ~150 examples/class into
+  a combinatorially larger training set — same-model pairs plus (critically) hard
+  different-model pairs. Comparable to how verification/metric-learning tasks are used in
+  face recognition and authorship-verification literature specifically because per-class
+  example counts are too small for plain softmax classifiers to learn cleanly.
+- **Must sample hard negatives deliberately**: random different-class pairs are mostly
+  "easy" (different provider families, obviously different). The pairs that actually matter
+  are the ones matching our confusion-matrix findings — claude-vs-glm, and sibling models
+  within a family (gemini-3.6/3.7/3.8-flash, gpt-5.6-luna/sol/terra, claude-opus-4-6/4-8).
+  A pair-sampler that oversamples exactly those hard negatives would directly target the
+  weakest point of every model we've tried so far.
+- **Inference-time reference set matters**: could store raw reference passages, or learned
+  per-model prototype embeddings (centroid of several references) — prototypes are cheaper
+  at inference (one comparison per model instead of k) and less noisy than any single
+  reference passage.
+- **Engineering cost is real**: pair generation, a similarity/distance network (could reuse
+  existing frozen or fine-tuned embeddings as the base, only need to learn a distance/
+  similarity function on top), and inference-time nearest-prototype matching — more moving
+  parts than a direct classifier. CV also needs care: reference passages must come from the
+  train side of each fold only, same leakage discipline as the external-data work.
+- Best treated as a parallel ensemble member / experiment once the simpler stacking and
+  external-data wins are banked, not a replacement for them.
+
+> **Step 1 TRIED — negative, see TRIED.md.** Zero-training cosine-similarity-to-reference-set
+> baseline scored 0.17-0.20 across variants, well below trained classifiers (~0.39-0.41). Per
+> the staged plan, this was the gate for Step 2 (learned pairwise verifier) — result says raw
+> embedding similarity doesn't carry enough signal on its own, so Step 2 was not attempted.
