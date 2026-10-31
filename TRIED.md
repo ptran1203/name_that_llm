@@ -85,3 +85,25 @@ caused (ruled out along the way: DDP -- reproduces single-GPU too; the family-au
 clamp+log formulation -- reproduces with `family_aux_weight=0`; external data -- reproduces
 without it). Default changed to `--label_smoothing 0` (off); re-enable only with a `--max_folds 1`
 quick-check on the actual target environment first.
+
+## Multi-GPU (DataParallel / DDP) training on Kaggle, in general
+
+Three separate, never-root-caused instability bugs hit on this exact script on Kaggle whenever
+more than one GPU is visible -- none reproduce on single GPU with the same config:
+1. **fp16 + GradScaler crash**: `ValueError: Attempting to unscale FP16 gradients`, both naive
+   `DataParallel` and proper `accelerate launch --multi_gpu` DDP. Worked around by defaulting
+   `--precision` to fp32.
+2. **Eval-gather misalignment**: a confirmed-good config (fine single-GPU) scored 0.0056 -- below
+   the random floor -- under DDP. Likely a label/prediction misalignment during distributed-eval
+   gather.
+3. **NaN gradient explosion independent of label smoothing**: `--label_smoothing 0` +
+   `--unfreeze_last_n 1` (fp32) trains clean on single GPU (confirmed via `CUDA_VISIBLE_DEVICES=0`)
+   but still NaNs by epoch 2 on two GPUs, config otherwise identical. So this is a second,
+   independent multi-GPU NaN trigger on top of #1 (the label-smoothing entry above is also
+   independent of GPU count -- it reproduces on single GPU too).
+
+No live CUDA debugging access to root-cause any of these properly. Pragmatic policy: **always
+train this script single-GPU on Kaggle** (`CUDA_VISIBLE_DEVICES=0`) -- a runtime warning in
+`train_transformer.py` now fires if `torch.cuda.device_count() > 1`. Partial fine-tuning
+(`--unfreeze_last_n`) is fast enough single-GPU that the multi-GPU speedup isn't worth chasing
+these bugs further right now.

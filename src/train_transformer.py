@@ -342,6 +342,13 @@ def main():
                           "with --max_folds 1 before trusting.")
     args = ap.parse_args()
 
+    if torch.cuda.device_count() > 1:
+        print(f"WARNING: {torch.cuda.device_count()} GPUs visible. This script has hit three "
+              f"separate, never-root-caused multi-GPU instability bugs on Kaggle (fp16 GradScaler "
+              f"crash, an eval-gather misalignment, and a NaN gradient explosion -- see TRIED.md). "
+              f"Strongly recommend CUDA_VISIBLE_DEVICES=0 (single GPU) unless you've specifically "
+              f"re-validated multi-GPU for this exact config.")
+
     run_name = args.run_name or args.model_name.replace("/", "_")
     run = ExperimentRun(run_name, config=vars(args))
 
