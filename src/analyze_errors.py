@@ -49,6 +49,33 @@ def plot_confusion(cm_norm, labels, out_path):
     plt.close(fig)
 
 
+def plot_per_class_recall(recalls, labels, out_path):
+    order = np.argsort(recalls)
+    labels_sorted = [labels[i] for i in order]
+    recalls_sorted = recalls[order]
+    mean_recall = recalls.mean()
+    random_floor = 1 / len(labels)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    colors = ["#d62728" if r < mean_recall else "#2ca02c" for r in recalls_sorted]
+    ax.barh(range(len(labels_sorted)), recalls_sorted, color=colors)
+    ax.set_yticks(range(len(labels_sorted)))
+    ax.set_yticklabels(labels_sorted, fontsize=9)
+    ax.set_xlabel("recall (balanced accuracy's per-class contribution)")
+    ax.set_title("Per-class recall -- fusion LGBM, best banked run (0.3482 CV)")
+    ax.axvline(mean_recall, color="black", linestyle="--", linewidth=1,
+               label=f"mean (balanced accuracy) = {mean_recall:.3f}")
+    ax.axvline(random_floor, color="gray", linestyle=":", linewidth=1,
+               label=f"random floor (1/{len(labels)}) = {random_floor:.3f}")
+    for i, r in enumerate(recalls_sorted):
+        ax.text(r + 0.01, i, f"{r:.2f}", va="center", fontsize=8)
+    ax.set_xlim(0, 1)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", default=None, help="defaults to the most recent fusion_lgbm run")
@@ -71,6 +98,11 @@ def main():
     out_path = os.path.join(run_dir, "artifacts", f"confusion_matrix_{args.pred_col}.png")
     plot_confusion(cm_norm, labels, out_path)
     print(f"saved confusion matrix plot -> {out_path}")
+
+    recalls = np.diag(cm_norm)
+    recall_out_path = os.path.join(run_dir, "artifacts", f"per_class_recall_{args.pred_col}.png")
+    plot_per_class_recall(recalls, labels, recall_out_path)
+    print(f"saved per-class recall plot -> {recall_out_path}")
 
     # top confusion pairs (true -> predicted), excluding the diagonal
     pairs = []
