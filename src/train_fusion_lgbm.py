@@ -28,7 +28,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from exp_log import ExperimentRun
 from paths import data_dir
 from stylometric import stylometric_matrix
-from train import build_vectorizers, fit_transform
+from train import SubwordTokenizer, build_vectorizers, fit_transform
 from train_transformer import TextDataset, build_curve, make_trainer
 
 
@@ -72,9 +72,15 @@ def main():
     ap.add_argument("--svd_dim", type=int, default=150)
     ap.add_argument("--checkpoint_dir", default=None,
                      help="reuse a previous run's fold checkpoints (experiments/<run_id>) instead of retraining")
+    ap.add_argument("--subword_tokenizer", default=None,
+                     help="HF model name whose tokenizer replaces the default regex word-"
+                          "splitter for the TF-IDF side of the fusion (see train.py). Confirmed "
+                          "+0.03 balanced accuracy on the plain TF-IDF+LR baseline (0.3382 vs "
+                          "0.3086, consistent across all 5 folds); untested here yet.")
     args = ap.parse_args()
 
     run = ExperimentRun("fusion_lgbm", config=vars(args))
+    subword_tokenizer = SubwordTokenizer(args.subword_tokenizer) if args.subword_tokenizer else None
 
     df = pd.read_csv(data_dir() / "train.csv")
     labels_sorted = sorted(df["model"].unique())
@@ -119,7 +125,7 @@ def main():
         transformer_scores.append(t_score)
         run.log(f"fold {fold}: transformer_only={t_score:.4f}")
 
-        word_vec, char_vec = build_vectorizers()
+        word_vec, char_vec = build_vectorizers(subword_tokenizer)
         X_tfidf_train = fit_transform(train_df["text"], word_vec, char_vec, fit=True)
         X_tfidf_val = fit_transform(val_df["text"], word_vec, char_vec, fit=False)
         svd = TruncatedSVD(n_components=args.svd_dim, random_state=args.seed)
