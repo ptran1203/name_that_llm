@@ -173,11 +173,18 @@ class MultiTaskTrainer(Trainer):
     glm); does nothing for within-family sibling confusions since family is already correct there.
     label_smoothing=0 and family_aux_weight=0 reduce this to plain unweighted cross-entropy."""
 
-    def __init__(self, *args, label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None, **kwargs):
+    def __init__(self, *args, label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None,
+                 loss_type="ce", **kwargs):
+        assert not (loss_type == "bce" and family_aux_weight > 0), (
+            "family_aux_weight's logsumexp marginalization assumes a shared softmax over "
+            "competing classes; under bce (independent per-class sigmoids) that's not a "
+            "coherent probability to marginalize. Not supported together."
+        )
         super().__init__(*args, **kwargs)
         self.label_smoothing = label_smoothing
         self.family_aux_weight = family_aux_weight
         self.family_matrix = family_matrix  # [num_labels, num_families] one-hot, or None
+        self.loss_type = loss_type
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         sample_weight = inputs.pop("sample_weight", None)
@@ -186,7 +193,16 @@ class MultiTaskTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits
 
-        per_example = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing, reduction="none")
+        if self.loss_type == "bce":
+            # One-vs-rest framing: 18 independent binary "is it this class" objectives sharing
+            # one trunk, instead of one shared 18-way softmax. Each class gets its own implicit
+            # decision threshold with no forced zero-sum competition between classes -- most of
+            # literal one-vs-rest's benefit without training 18 separate models. Mean (not sum)
+            # over classes to keep the loss scale comparable to plain cross-entropy.
+            targets = F.one_hot(labels, num_classes=logits.size(-1)).to(logits.dtype)
+            per_example = F.binary_cross_entropy_with_logits(logits, targets, reduction="none").mean(dim=-1)
+        else:
+            per_example = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing, reduction="none")
 
         if self.family_aux_weight > 0 and family_label is not None and self.family_matrix is not None:
             # log P(family) = logsumexp(logits over that family's labels) - logsumexp(all logits).
@@ -213,7 +229,7 @@ class MultiTaskTrainer(Trainer):
 
 def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42,
                   unfreeze_last_n=None, precision="fp16", max_steps=None,
-                  label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None):
+                  label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None, loss_type="ce"):
     # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
     # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
     # is constructed afterward -- too late to control this init.
@@ -283,6 +299,7 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         label_smoothing=label_smoothing,
         family_aux_weight=family_aux_weight,
         family_matrix=family_matrix,
+        loss_type=loss_type,
     )
 
 
@@ -339,7 +356,14 @@ def main():
                      help="weight of the family-level auxiliary loss (0 = off). Marginalizes the "
                           "18-way softmax into FAMILY_PREFIXES groups; targets cross-family "
                           "confusions like claude-vs-glm. Try e.g. 0.3 -- untested, quick-check "
-                          "with --max_folds 1 before trusting.")
+                          "with --max_folds 1 before trusting. Not compatible with --loss_type bce "
+                          "(the marginalization needs a shared softmax).")
+    ap.add_argument("--loss_type", default="ce", choices=["ce", "bce"],
+                     help="ce (default) = standard 18-way softmax cross-entropy. bce = one-vs-rest "
+                          "framing: 18 independent per-class binary objectives sharing one trunk "
+                          "(each class gets its own implicit threshold, no forced competition "
+                          "between classes) -- most of literal one-vs-rest's benefit without "
+                          "training 18 separate models. Untested; quick-check with --max_folds 1.")
     args = ap.parse_args()
 
     if torch.cuda.device_count() > 1:
@@ -428,7 +452,7 @@ def main():
             epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
             unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
             label_smoothing=args.label_smoothing, family_aux_weight=args.family_aux_weight,
-            family_matrix=family_matrix,
+            family_matrix=family_matrix, loss_type=args.loss_type,
         )
         trainer.train()
         run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
@@ -456,7 +480,7 @@ def main():
             out_dir=str(out_dir), epochs=args.epochs, bs=args.batch_size, lr=args.lr, seed=args.seed,
             unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
             label_smoothing=args.label_smoothing, family_aux_weight=args.family_aux_weight,
-            family_matrix=family_matrix,
+            family_matrix=family_matrix, loss_type=args.loss_type,
         )
         trainer.train()
         run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)
