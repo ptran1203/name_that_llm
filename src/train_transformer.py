@@ -40,6 +40,15 @@ def family_of(label):
     return label
 
 
+def mean_pool(hidden_states, attention_mask):
+    """Mean-pools a transformer's last hidden state over real (non-padding) tokens -- same
+    convention used for frozen-embedding extraction elsewhere in this project."""
+    mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+    summed = (hidden_states * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp_min(1e-9)
+    return summed / counts
+
+
 def load_external_pool(cap_per_class, label2id):
     """ntl_open_pool.parquet (226k rows, pooled from many public Kaggle datasets): drop rows
     flagged near-duplicate to official train prompts, regenerated, or at risk of Gemini-3.7
@@ -174,7 +183,7 @@ class MultiTaskTrainer(Trainer):
     label_smoothing=0 and family_aux_weight=0 reduce this to plain unweighted cross-entropy."""
 
     def __init__(self, *args, label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None,
-                 loss_type="ce", **kwargs):
+                 loss_type="ce", center_loss_weight=0.0, center_loss_momentum=0.5, **kwargs):
         assert not (loss_type == "bce" and family_aux_weight > 0), (
             "family_aux_weight's logsumexp marginalization assumes a shared softmax over "
             "competing classes; under bce (independent per-class sigmoids) that's not a "
@@ -185,6 +194,9 @@ class MultiTaskTrainer(Trainer):
         self.family_aux_weight = family_aux_weight
         self.family_matrix = family_matrix  # [num_labels, num_families] one-hot, or None
         self.loss_type = loss_type
+        self.center_loss_weight = center_loss_weight
+        self.center_loss_momentum = center_loss_momentum
+        self.centers = None  # lazy-init [num_labels, hidden_size] buffer, EMA-updated, never backprop'd
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         sample_weight = inputs.pop("sample_weight", None)
@@ -218,6 +230,43 @@ class MultiTaskTrainer(Trainer):
             family_loss = F.nll_loss(family_log_probs, family_label, reduction="none")
             per_example = per_example + self.family_aux_weight * family_loss
 
+        if self.center_loss_weight > 0:
+            # Center loss (Wen et al. 2016): pulls each example's pooled embedding toward a
+            # persistent, EMA-updated per-class center -- unlike a within-batch pairwise term,
+            # this still works when most batches have 0-1 examples per class (18 classes, small
+            # batch_size). Centers are plain buffers updated under no_grad(), never learned via
+            # backprop (standard practice -- letting gradient flow into centers too makes the
+            # pull direction ambiguous and risks degenerate collapse).
+            #
+            # Embedding comes from a SEPARATE encoder-only forward pass, not output_hidden_states
+            # on the classification-head call above: requesting hidden_states there leaked into
+            # `outputs`, and Trainer's own eval/predict code tries to gather every field in it as
+            # a prediction, mixing flat logits with the nested hidden_states tuple -- broke numpy
+            # stacking with "inhomogeneous shape" during the very next eval. Doubles encoder
+            # compute when this is on, but keeps `outputs` exactly as Trainer expects it.
+            base_model = model.module if hasattr(model, "module") else model  # unwrap DataParallel, defensive
+            encoder = base_model.base_model
+            encoder_keys = ("input_ids", "attention_mask", "token_type_ids")
+            encoder_inputs = {k: v for k, v in inputs.items() if k in encoder_keys}
+            last_hidden = encoder(**encoder_inputs).last_hidden_state
+            embed = mean_pool(last_hidden, inputs["attention_mask"])
+            embed = F.normalize(embed, dim=-1)  # unit vectors -> squared distance bounded to [0, 4]
+
+            if self.centers is None:
+                self.centers = torch.zeros(logits.size(-1), embed.size(-1),
+                                            device=embed.device, dtype=embed.dtype)
+            if model.training:
+                with torch.no_grad():
+                    for c in labels.unique().tolist():
+                        batch_center = embed[labels == c].mean(dim=0)
+                        self.centers[c] = ((1 - self.center_loss_momentum) * self.centers[c]
+                                            + self.center_loss_momentum * batch_center)
+                        self.centers[c] = F.normalize(self.centers[c], dim=0)
+
+            center_targets = self.centers[labels].detach()
+            intra_loss = ((embed - center_targets) ** 2).sum(dim=-1)
+            per_example = per_example + self.center_loss_weight * intra_loss
+
         if sample_weight is not None:
             sample_weight = sample_weight.to(per_example.dtype)
             loss = (per_example * sample_weight).sum() / sample_weight.sum().clamp_min(1e-8)
@@ -229,29 +278,37 @@ class MultiTaskTrainer(Trainer):
 
 def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, lr, seed=42,
                   unfreeze_last_n=None, precision="fp16", max_steps=None,
-                  label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None, loss_type="ce"):
-    # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is randomly
-    # initialized right here, and TrainingArguments(seed=...) only takes effect once the Trainer
-    # is constructed afterward -- too late to control this init.
-    set_seed(seed)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=18)
-    trainable, frozen = freeze_layers(model, unfreeze_last_n)
-    if trainable is not None:
-        print(f"unfreeze_last_n={unfreeze_last_n}: trainable={trainable:,} frozen={frozen:,} "
-              f"({100 * trainable / (trainable + frozen):.1f}% trainable)")
+                  label_smoothing=0.0, family_aux_weight=0.0, family_matrix=None, loss_type="ce",
+                  center_loss_weight=0.0, center_loss_momentum=0.5, model=None):
+    # model=None (default): build fresh from model_name, as before. model=<an already-trained
+    # model>: skip from_pretrained/seeding/freeze_layers entirely and continue fine-tuning it as
+    # -is -- used for the official-only polish phase, which must continue from phase 1's learned
+    # weights, not restart from the pretrained checkpoint.
+    if model is None:
+        # Must seed BEFORE from_pretrained: the classification head (classifier/pooler) is
+        # randomly initialized right here, and TrainingArguments(seed=...) only takes effect once
+        # the Trainer is constructed afterward -- too late to control this init.
+        set_seed(seed)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=18)
+        trainable, frozen = freeze_layers(model, unfreeze_last_n)
+        if trainable is not None:
+            print(f"unfreeze_last_n={unfreeze_last_n}: trainable={trainable:,} frozen={frozen:,} "
+                  f"({100 * trainable / (trainable + frozen):.1f}% trainable)")
 
-    if precision == "fp16":
-        # Diagnostic for the known Kaggle (transformers 5.x) crash: "Attempting to unscale FP16
-        # gradients" during grad-clipping. Expected/correct state for autocast-based fp16 mixed
-        # precision is fp32 master weights; if from_pretrained() itself produced fp16 weights,
-        # that's the actual bug, and this will say so immediately instead of failing opaquely
-        # mid-training (and only on whichever rank/step happens to print first under DDP).
-        model_dtype = next(model.parameters()).dtype
-        if model_dtype != torch.float32:
-            print(f"WARNING: model loaded as {model_dtype}, not float32 -- fp16 mixed precision "
-                  f"expects fp32 master weights and will likely crash with 'Attempting to unscale "
-                  f"FP16 gradients' during grad-clipping. This confirms from_pretrained() itself is "
-                  f"producing non-fp32 weights on this environment, not an autocast config issue.")
+        if precision == "fp16":
+            # Diagnostic for the known Kaggle (transformers 5.x) crash: "Attempting to unscale
+            # FP16 gradients" during grad-clipping. Expected/correct state for autocast-based fp16
+            # mixed precision is fp32 master weights; if from_pretrained() itself produced fp16
+            # weights, that's the actual bug, and this will say so immediately instead of failing
+            # opaquely mid-training (and only on whichever rank/step happens to print first under
+            # DDP).
+            model_dtype = next(model.parameters()).dtype
+            if model_dtype != torch.float32:
+                print(f"WARNING: model loaded as {model_dtype}, not float32 -- fp16 mixed "
+                      f"precision expects fp32 master weights and will likely crash with "
+                      f"'Attempting to unscale FP16 gradients' during grad-clipping. This confirms "
+                      f"from_pretrained() itself is producing non-fp32 weights on this environment, "
+                      f"not an autocast config issue.")
 
     # max_steps: for smoke/correctness tests -- train.py's --max_steps overrides epoch-based
     # training entirely, so e.g. --max_steps 1 --batch_size 2 runs exactly one batch, not a full
@@ -300,7 +357,35 @@ def make_trainer(model_name, train_ds, val_ds, tokenizer, out_dir, epochs, bs, l
         family_aux_weight=family_aux_weight,
         family_matrix=family_matrix,
         loss_type=loss_type,
+        center_loss_weight=center_loss_weight,
+        center_loss_momentum=center_loss_momentum,
     )
+
+
+def maybe_finetune_official_only(trainer, official_df, val_ds, tokenizer, args, out_dir, family_matrix, run, log_name):
+    """If --final_epochs_official_only > 0 and external data is in use, continues fine-tuning
+    `trainer`'s already-trained model for a few more epochs on official_df only (external rows
+    dropped) -- lets the model get the volume/diversity benefit of external data during the main
+    phase, then specialize back to the exact target distribution at the end. Continues from the
+    current weights (model=trainer.model), doesn't restart from the pretrained checkpoint. No-op
+    if the flag is off or no external data was used (nothing to drop)."""
+    if args.final_epochs_official_only <= 0:
+        return trainer
+    official_ds = TextDataset(official_df["text"], official_df["label"].tolist(), tokenizer, args.max_length,
+                               weights=official_df["sample_weight"].tolist(),
+                               family_labels=official_df["family_label"].tolist())
+    final_trainer = make_trainer(
+        args.model_name, official_ds, val_ds, tokenizer,
+        out_dir=out_dir, epochs=args.final_epochs_official_only, bs=args.batch_size, lr=args.lr,
+        seed=args.seed, unfreeze_last_n=args.unfreeze_last_n, precision=args.precision,
+        max_steps=args.max_steps, label_smoothing=args.label_smoothing,
+        family_aux_weight=args.family_aux_weight, family_matrix=family_matrix, loss_type=args.loss_type,
+        center_loss_weight=args.center_loss_weight, center_loss_momentum=args.center_loss_momentum,
+        model=trainer.model,
+    )
+    final_trainer.train()
+    run.log_curve(log_name, build_curve(final_trainer.state.log_history))
+    return final_trainer
 
 
 def main():
@@ -364,6 +449,26 @@ def main():
                           "(each class gets its own implicit threshold, no forced competition "
                           "between classes) -- most of literal one-vs-rest's benefit without "
                           "training 18 separate models. Untested; quick-check with --max_folds 1.")
+    ap.add_argument("--center_loss_weight", type=float, default=0.0,
+                     help="weight of a center-loss auxiliary term (0 = off). Pulls each example's "
+                          "pooled, L2-normalized embedding toward a persistent EMA-updated "
+                          "per-class center (Wen et al. 2016), directly tightening intra-class "
+                          "clusters in embedding space -- independent of --loss_type/"
+                          "family_aux_weight, can combine with either. Squared distance on unit "
+                          "vectors is bounded to [0, 4], similar scale to the main loss, so start "
+                          "around 0.1. Untested; quick-check with --max_folds 1 before trusting.")
+    ap.add_argument("--center_loss_momentum", type=float, default=0.5,
+                     help="EMA update rate for center_loss's per-class centers (Wen et al. 2016 "
+                          "default). Only matters if --center_loss_weight > 0.")
+    ap.add_argument("--final_epochs_official_only", type=float, default=0.0,
+                     help="if > 0 and external data is in use (--external_paths / "
+                          "--external_pool_cap_per_class), continues fine-tuning for this many "
+                          "extra epochs on official competition data ONLY (external rows dropped), "
+                          "continuing from the main phase's weights rather than restarting -- lets "
+                          "the model benefit from external data's extra volume/diversity during "
+                          "the main phase, then specialize back to the exact target distribution "
+                          "(no external label noise/imbalance) at the end. No-op without external "
+                          "data. Untested; quick-check with --max_folds 1 before trusting.")
     args = ap.parse_args()
 
     if torch.cuda.device_count() > 1:
@@ -436,11 +541,11 @@ def main():
     ):
         if args.max_folds is not None and fold >= args.max_folds:
             break
-        train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
+        official_train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
         # external rows always join the TRAIN side only -- val stays pure official so CV remains
         # an honest estimate of generalization to competition data.
-        if ext_df is not None:
-            train_df = pd.concat([train_df, ext_df], ignore_index=True)
+        train_df = (pd.concat([official_train_df, ext_df], ignore_index=True)
+                    if ext_df is not None else official_train_df)
         train_ds = TextDataset(train_df["text"], train_df["label"].tolist(), tokenizer, args.max_length,
                                 weights=train_df["sample_weight"].tolist(),
                                 family_labels=train_df["family_label"].tolist())
@@ -453,9 +558,18 @@ def main():
             unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
             label_smoothing=args.label_smoothing, family_aux_weight=args.family_aux_weight,
             family_matrix=family_matrix, loss_type=args.loss_type,
+            center_loss_weight=args.center_loss_weight, center_loss_momentum=args.center_loss_momentum,
         )
         trainer.train()
         run.log_curve(f"fold{fold}", build_curve(trainer.state.log_history))
+
+        if ext_df is not None:
+            trainer = maybe_finetune_official_only(
+                trainer, official_train_df, val_ds, tokenizer, args,
+                str(run.artifact_path(f"fold{fold}_ckpt_official_only")), family_matrix, run,
+                f"fold{fold}_official_only",
+            )
+
         preds = trainer.predict(val_ds)
         pred_labels = np.argmax(preds.predictions, axis=-1)
         oof_pred[val_idx] = pred_labels
@@ -481,9 +595,18 @@ def main():
             unfreeze_last_n=args.unfreeze_last_n, precision=args.precision, max_steps=args.max_steps,
             label_smoothing=args.label_smoothing, family_aux_weight=args.family_aux_weight,
             family_matrix=family_matrix, loss_type=args.loss_type,
+            center_loss_weight=args.center_loss_weight, center_loss_momentum=args.center_loss_momentum,
         )
         trainer.train()
         run.log_curve("final_fit", build_curve(trainer.state.log_history))  # note: eval here is in-sample (val_ds == train_ds)
+
+        if ext_df is not None:
+            trainer = maybe_finetune_official_only(
+                trainer, df, full_ds, tokenizer, args,
+                str(run.artifact_path("final_model_official_only_ckpt")), family_matrix, run,
+                "final_fit_official_only",
+            )
+
         os.makedirs(out_dir, exist_ok=True)
         trainer.save_model(out_dir)
         tokenizer.save_pretrained(out_dir)
