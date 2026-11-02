@@ -4,6 +4,20 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Custom BPE tokenizer trained from scratch for TF-IDF (IDEAS.md #8)
+
+`CustomBPETokenizer` in `train.py`, vocab_size=5000, fold 0 only (not a full 5-fold CV).
+Train.csv-only: 0.3296. Train.csv + external data (prvsiyan + darragh1walsh + 20k-row sample of
+ntl_open_pool): 0.3222 -- *worse*, not better. Both clearly beat the plain regex baseline (0.2889)
+but neither beats reusing a pretrained transformer's subword tokenizer (SubwordTokenizer,
+DeBERTa-v3, already confirmed full 5-fold: 0.3382 train.py baseline mean, 0.3352 on this same
+fold 0). Counter to the hypothesis behind #8 (more/external data -> a better from-scratch
+vocabulary): with a fixed vocab size, pooling in ~27k external rows (13x more text, more
+topically/stylistically diverse) spread the limited merge slots across a broader, less-targeted
+corpus, diluting specificity to our exact 18 official models rather than adding signal. Single-
+fold result, not exhaustively tuned (one vocab_size only) -- directionally clear enough to
+deprioritize, but not a fully confirmed negative the way a 5-fold result would be.
+
 ## Mixup augmentation (feature-space, on TF-IDF)
 `experiment_mixup.py`. Interpolating two same-class TF-IDF vectors at multiplier 1.0 and 2.0:
 0.3049 and 0.3012 CV, both *below* the plain baseline (0.3086). Cause: TF-IDF is topic-driven,

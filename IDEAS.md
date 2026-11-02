@@ -147,6 +147,11 @@ lever from what we just tried — captures vocabulary specific to *our* 18 model
 than whatever DeBERTa happened to learn from its own pretraining data. Cheap to test
 (HuggingFace `tokenizers` library).
 
+> **TRIED (fold 0 only) — negative, see TRIED.md.** Train.csv-only: 0.3296. Train.csv + external
+> data: 0.3222 (worse, counter to the hypothesis that more data helps the from-scratch vocab).
+> Neither beat reusing DeBERTa's pretrained subword tokenizer (0.3352 on the same fold). Single-
+> fold, not exhaustively tuned (one vocab_size) — directionally discouraging, not fully confirmed.
+
 ## 9. Punctuation n-grams (order-preserving) as a dedicated feature channel
 
 Our stylometric features count punctuation *rates* (comma_rate, semicolon_rate, etc.) — loses

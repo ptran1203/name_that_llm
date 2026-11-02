@@ -55,6 +55,43 @@ class SubwordTokenizer:
         self._tok = None
 
 
+class CustomBPETokenizer:
+    """BPE tokenizer trained FROM SCRATCH on a given text corpus (IDEAS.md #8), instead of
+    reusing a pretrained HF tokenizer's fixed, externally-learned vocabulary (SubwordTokenizer
+    above). Learns a vocabulary specific to whatever corpus is handed to .fit() -- unsupervised,
+    so including unlabeled/external text carries no leakage risk the way using it for actual
+    classifier training would. Must call .fit(texts) before use; picklable via tokenizers'
+    built-in to_str()/from_str() JSON (de)serialization, so this survives fit_final's joblib.dump
+    once fitted."""
+
+    def __init__(self, vocab_size=5000):
+        self.vocab_size = vocab_size
+        self._tok = None
+
+    def fit(self, texts):
+        from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+        tok = Tokenizer(models.BPE(unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        trainer = trainers.BpeTrainer(vocab_size=self.vocab_size, special_tokens=["[UNK]"])
+        tok.train_from_iterator(list(texts), trainer=trainer)
+        self._tok = tok
+        return self
+
+    def __call__(self, text):
+        assert self._tok is not None, "CustomBPETokenizer.fit() must be called before use"
+        return self._tok.encode(text).tokens
+
+    def __getstate__(self):
+        return {"vocab_size": self.vocab_size, "tok_json": self._tok.to_str() if self._tok else None}
+
+    def __setstate__(self, state):
+        self.vocab_size = state["vocab_size"]
+        self._tok = None
+        if state["tok_json"] is not None:
+            from tokenizers import Tokenizer
+            self._tok = Tokenizer.from_str(state["tok_json"])
+
+
 def build_vectorizers(subword_tokenizer=None):
     if subword_tokenizer is not None:
         # Subword vocabulary comes from large external pretraining (BPE/SentencePiece), not fit
