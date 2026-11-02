@@ -163,6 +163,12 @@ run a small char-n-gram TfidfVectorizer over it, concatenate into the existing f
 relevant to the claude<->glm confusion given punctuation is already our strongest known signal
 there (semicolon_rate, curly quotes).
 
+> **TRIED — negative, see TRIED.md.** Full 5-fold CV, two configurations: made the plain regex
+> baseline worse (0.3086 -> 0.3004) and made the subword-tokenizer baseline worse (0.3382 ->
+> 0.3142). Short per-passage punctuation streams (~20-80 chars) produce mostly sparse, low-count
+> n-gram features at our data size -- order-preservation apparently isn't worth the added
+> sparsity cost here.
+
 ## 10. Pseudo-label external unlabeled data (not the competition test set)
 
 Already deprioritized pseudo-labeling our own ~4000-row test set directly (risk of reinforcing

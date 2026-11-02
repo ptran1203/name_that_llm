@@ -4,6 +4,21 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Punctuation n-grams as a dedicated TF-IDF channel (IDEAS.md #9)
+
+`--punctuation_ngrams` in `train.py` (char n-gram 1-3 TF-IDF over just the punctuation stream,
+order preserved, word content stripped). Full 5-fold CV, two configurations: plain regex baseline
+0.3086 -> 0.3004 with punctuation n-grams added (worse); subword-tokenizer baseline 0.3382 ->
+0.3142 with punctuation n-grams added (also worse, similar-sized drop). Consistent negative
+across both bases. Likely cause: per-passage punctuation streams are short (~20-80 chars), so
+char n-grams over them produce mostly sparse, low-count features -- adds overfitting risk rather
+than clean signal, especially stacked on top of features that already capture similar information
+more smoothly (char_wb n-grams already in the pipeline, and the rate-based punctuation features in
+stylometric.py, e.g. semicolon_rate, which is our single strongest individual feature). Order-
+preservation (the theoretical advantage over rate features) apparently isn't worth the added
+sparsity cost at this data size. PAN's result (where this helped) was presumably on a
+much larger corpus.
+
 ## Custom BPE tokenizer trained from scratch for TF-IDF (IDEAS.md #8)
 
 `CustomBPETokenizer` in `train.py`, vocab_size=5000, fold 0 only (not a full 5-fold CV).
