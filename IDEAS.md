@@ -127,3 +127,43 @@ untried on this problem so far.
 > baseline scored 0.17-0.20 across variants, well below trained classifiers (~0.39-0.41). Per
 > the staged plan, this was the gate for Step 2 (learned pairwise verifier) — result says raw
 > embedding similarity doesn't carry enough signal on its own, so Step 2 was not attempted.
+
+## 7. NBSVM (Naive Bayes-weighted TF-IDF)
+
+Scale each TF-IDF feature by its Naive Bayes log-count ratio before feeding it to Logistic
+Regression, instead of using raw/plain TF-IDF weights as `train.py` does now. Wang & Manning
+2012 ("Baselines and Bigrams"), popularized via Jeremy Howard's "NB-SVM strong linear baseline"
+Kaggle kernel for the Jigsaw Toxic Comment competition. Cheap: one extra transform step before
+`.fit()`, no architecture change. See COMPETITION_RESEARCH.md for sources.
+
+## 8. Corpus-specific BPE tokenizer (trained from scratch) for TF-IDF
+
+We confirmed reusing a *pretrained* transformer's subword tokenizer (DeBERTa-v3) for TF-IDF
+gives +0.03 balanced accuracy (0.3382 vs 0.3086, see TRIED.md / experiments). The Kaggle
+LLM-Detect-AI-Generated-Text winners did something related but distinct: train a BPE tokenizer
+*from scratch* on the competition's own corpus (train+test combined, unsupervised — no leakage
+risk since no labels involved), then TF-IDF over those corpus-specific subword tokens. Different
+lever from what we just tried — captures vocabulary specific to *our* 18 models' outputs rather
+than whatever DeBERTa happened to learn from its own pretraining data. Cheap to test
+(HuggingFace `tokenizers` library).
+
+## 9. Punctuation n-grams (order-preserving) as a dedicated feature channel
+
+Our stylometric features count punctuation *rates* (comma_rate, semicolon_rate, etc.) — loses
+sequence/order information. PAN authorship-attribution research found punctuation n-grams (char
+n-grams computed over just the extracted punctuation stream, preserving order) add signal beyond
+rate-based features and beyond general char n-grams (where punctuation gets drowned out in a 3-5
+char window dominated by letters). Cheap: regex-extract the punctuation-only string per passage,
+run a small char-n-gram TfidfVectorizer over it, concatenate into the existing fusion. Directly
+relevant to the claude<->glm confusion given punctuation is already our strongest known signal
+there (semicolon_rate, curly quotes).
+
+## 10. Pseudo-label external unlabeled data (not the competition test set)
+
+Already deprioritized pseudo-labeling our own ~4000-row test set directly (risk of reinforcing
+existing blind spots on hard classes at ~0.32-0.35 balanced accuracy). Jigsaw Multilingual's
+winners did something more specific: pseudo-label a *separate* unlabeled corpus with a trained
+model, then add high-confidence pseudo-labels as extra weighted training data — same discipline
+already applied to external data (train-fold-only, down-weighted), just generating labels
+ourselves instead of relying on a third party. Could apply to unlabeled/low-confidence rows in
+`ntl_open_pool.parquet` or any other unlabeled LLM-text source.
