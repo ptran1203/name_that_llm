@@ -204,7 +204,36 @@ def build_punctuation_vectorizer():
     )
 
 
-def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False):
+# Classic authorship-attribution signal (Mosteller & Wallace's Federalist Papers study, Burrows'
+# Delta method): function words (pronouns, prepositions, conjunctions, articles, auxiliaries)
+# are topic-independent and used largely unconsciously, so their RELATIVE frequencies carry
+# authorial style with little content leakage -- distinct from word_vec (dominated by content
+# n-grams) and from stylometric.py's hand-picked rate features (a handful of individual words/
+# punctuation marks, not this whole closed class at once).
+FUNCTION_WORDS = sorted(set("""
+a about above after again against all am an and any are as at be because been
+before being below between both but by can could did do does down during each
+few for from further had has have having he her here hers herself him himself
+his how i if in into is it its itself just me more most my myself no nor not
+now of off on once only or other our ours ourselves out over own same she
+should so some such than that the their theirs them themselves then there
+these they this those through to too under until up very was we were what
+when where which while who whom why will with would you your yours yourself
+yourselves
+""".split()))
+
+
+def build_function_word_vectorizer():
+    return TfidfVectorizer(
+        vocabulary=FUNCTION_WORDS,
+        analyzer="word",
+        token_pattern=r"[A-Za-z']+",
+        lowercase=True,
+        sublinear_tf=True,
+    )
+
+
+def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False, use_function_words=False):
     if subword_tokenizer is not None:
         # Subword vocabulary comes from large external pretraining (BPE/SentencePiece), not fit
         # from scratch on our ~2699 rows -- a form of transfer that should reduce overfitting risk
@@ -233,10 +262,11 @@ def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False):
         analyzer="char_wb",
     )
     punct_vec = build_punctuation_vectorizer() if use_punctuation_ngrams else None
-    return word_vec, char_vec, punct_vec
+    func_vec = build_function_word_vectorizer() if use_function_words else None
+    return word_vec, char_vec, punct_vec, func_vec
 
 
-def fit_transform(texts, word_vec, char_vec, punct_vec=None, fit=True):
+def fit_transform(texts, word_vec, char_vec, punct_vec=None, func_vec=None, fit=True):
     if fit:
         xw = word_vec.fit_transform(texts)
         xc = char_vec.fit_transform(texts)
@@ -248,6 +278,11 @@ def fit_transform(texts, word_vec, char_vec, punct_vec=None, fit=True):
         punct_texts = [extract_punctuation_stream(t) for t in texts]
         xp = punct_vec.fit_transform(punct_texts) if fit else punct_vec.transform(punct_texts)
         parts.append(xp)
+    if func_vec is not None:
+        # Fixed vocabulary -- fit_transform/transform behave identically either way, but keep the
+        # fit/not-fit split explicit for consistency with the other two vectorizers above.
+        xf = func_vec.fit_transform(texts) if fit else func_vec.transform(texts)
+        parts.append(xf)
     return hstack(parts).tocsr()
 
 
@@ -256,7 +291,7 @@ def default_clf_factory():
 
 
 def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
-                    clf_factory=default_clf_factory):
+                    use_function_words=False, clf_factory=default_clf_factory):
     """Returns (scores, oof_proba, class_labels) -- oof_proba is [n_rows, n_classes], aligned to
     df's row order (np.nan where a row was never in a val fold, shouldn't happen with the full
     GroupKFold split). Saved by main() so different tokenizer_spec/clf_factory runs produce
@@ -288,9 +323,10 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
         tokenizer = (build_tokenizer_from_spec(tokenizer_spec).fit(train_df["text"])
                      if refit_per_fold else shared_tokenizer)
 
-        word_vec, char_vec, punct_vec = build_vectorizers(tokenizer, use_punctuation_ngrams)
-        X_train = fit_transform(train_df["text"], word_vec, char_vec, punct_vec, fit=True)
-        X_val = fit_transform(val_df["text"], word_vec, char_vec, punct_vec, fit=False)
+        word_vec, char_vec, punct_vec, func_vec = build_vectorizers(
+            tokenizer, use_punctuation_ngrams, use_function_words)
+        X_train = fit_transform(train_df["text"], word_vec, char_vec, punct_vec, func_vec, fit=True)
+        X_val = fit_transform(val_df["text"], word_vec, char_vec, punct_vec, func_vec, fit=False)
 
         clf = clf_factory()
         clf.fit(X_train, train_df["model"])
@@ -307,15 +343,19 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
 
 
 def fit_final(df, artifact_path, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
-              clf_factory=default_clf_factory):
+              use_function_words=False, clf_factory=default_clf_factory):
     tokenizer = build_tokenizer_from_spec(tokenizer_spec)
     if tokenizer is not None:
         tokenizer.fit(df["text"])
-    word_vec, char_vec, punct_vec = build_vectorizers(tokenizer, use_punctuation_ngrams)
-    X = fit_transform(df["text"], word_vec, char_vec, punct_vec, fit=True)
+    word_vec, char_vec, punct_vec, func_vec = build_vectorizers(
+        tokenizer, use_punctuation_ngrams, use_function_words)
+    X = fit_transform(df["text"], word_vec, char_vec, punct_vec, func_vec, fit=True)
     clf = clf_factory()
     clf.fit(X, df["model"])
-    joblib.dump({"word_vec": word_vec, "char_vec": char_vec, "punct_vec": punct_vec, "clf": clf}, artifact_path)
+    joblib.dump(
+        {"word_vec": word_vec, "char_vec": char_vec, "punct_vec": punct_vec, "func_vec": func_vec, "clf": clf},
+        artifact_path,
+    )
     log(f"saved final model to {artifact_path}")
 
 
@@ -337,7 +377,13 @@ def main():
                           "from stylometric.py's punctuation RATE features (no order) and from "
                           "char_vec's char_wb n-grams (punctuation drowned out by surrounding "
                           "letters). PAN research found this adds signal for authorship "
-                          "attribution specifically (IDEAS.md #9). Untested here.")
+                          "attribution specifically (IDEAS.md #9). TRIED -- negative, see TRIED.md.")
+    ap.add_argument("--function_words", action="store_true",
+                     help="add a word-level TF-IDF block restricted to a fixed ~140-word function-"
+                          "word vocabulary (pronouns, prepositions, conjunctions, articles, "
+                          "auxiliaries) -- classic authorship-attribution signal (Mosteller & "
+                          "Wallace, Burrows' Delta), topic-independent unlike word_vec's content "
+                          "n-grams. Untested here.")
     ap.add_argument("--classifier", default="lr", choices=["lr", "nbsvm"],
                      help="lr (default) = LogisticRegression(C=5.0, class_weight='balanced'). "
                           "nbsvm = NBSVM (IDEAS.md #7): scales TF-IDF features by each class's "
@@ -348,11 +394,13 @@ def main():
 
     config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5,
               "tokenizer_spec": args.tokenizer_spec, "punctuation_ngrams": args.punctuation_ngrams,
-              "classifier": args.classifier}
+              "function_words": args.function_words, "classifier": args.classifier}
     run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else (
         "tfidf_lr_" + args.tokenizer_spec.split(":")[0].replace("/", "-"))
     if args.punctuation_ngrams:
         run_name += "_punct"
+    if args.function_words:
+        run_name += "_func"
     if args.classifier != "lr":
         run_name += "_" + args.classifier
     run = ExperimentRun(run_name, config=config)
@@ -360,7 +408,8 @@ def main():
     df = pd.read_csv(data_dir() / "train.csv")
     scores, oof_proba, class_labels = cross_validate(
         df, n_splits=config["n_splits"], log=run.log, tokenizer_spec=args.tokenizer_spec,
-        use_punctuation_ngrams=args.punctuation_ngrams, clf_factory=clf_factory,
+        use_punctuation_ngrams=args.punctuation_ngrams, use_function_words=args.function_words,
+        clf_factory=clf_factory,
     )
     run.log_scores("balanced_accuracy", scores)
     np.save(run.artifact_path("oof_proba.npy"), oof_proba)
@@ -371,7 +420,7 @@ def main():
 
     fit_final(df, run.artifact_path("baseline.joblib"), log=run.log,
               tokenizer_spec=args.tokenizer_spec, use_punctuation_ngrams=args.punctuation_ngrams,
-              clf_factory=clf_factory)
+              use_function_words=args.function_words, clf_factory=clf_factory)
 
 
 if __name__ == "__main__":

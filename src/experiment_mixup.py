@@ -57,7 +57,7 @@ def run_experiment(multiplier, alpha=0.4, n_splits=5):
     plain_scores, aug_scores = [], []
     for fold, (train_idx, val_idx) in enumerate(gkf.split(df, df["model"], groups=df["prompt_id"])):
         train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
-        word_vec, char_vec, _punct_vec = build_vectorizers()
+        word_vec, char_vec, _punct_vec, _func_vec = build_vectorizers()
         X_train = fit_transform(train_df["text"], word_vec, char_vec, fit=True)
         X_val = fit_transform(val_df["text"], word_vec, char_vec, fit=False)
         y_train = train_df["model"].values

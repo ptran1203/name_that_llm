@@ -4,6 +4,33 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Function-word TF-IDF as a dedicated feature channel
+
+`--function_words` in `train.py`: a word-level TF-IDF block restricted to a fixed ~140-word
+function-word vocabulary (pronouns, prepositions, conjunctions, articles, auxiliaries) -- the
+classic Mosteller & Wallace / Burrows' Delta authorship-attribution signal, added as a 4th
+feature block alongside word_vec/char_vec/punct_vec. Full 5-fold CV, two bases, same pattern as
+the punctuation-n-grams test: plain baseline 0.3086 -> 0.2845 (worse); DeBERTa-v3 tokenizer base
+0.3382 -> 0.3015 (worse, larger drop). Consistent negative on both bases. Likely cause: these
+same function words are already present in word_vec's own (1,2) n-grams, just IDF-downweighted
+there because they're common across every class -- forcing them into a SEPARATE TF-IDF block
+with a restricted vocabulary (so their IDF stats are computed only among themselves, not
+downweighted the same way) creates a competing, inconsistent representation of the same
+underlying words rather than new information, which likely cost more via overfitting/dilution
+than it added. Same shape of failure as punctuation n-grams (IDEAS.md #9): a second feature
+channel fighting with word_vec over control of mostly-the-same underlying signal.
+
+## Ensembling the 3 pretrained-tokenizer TF-IDF variants by simple OOF-probability averaging
+
+Free check using already-computed OOF arrays (no new training): simple-averaged the per-class
+probabilities from the DeBERTa-v3 (0.3382), Qwen2.5 (0.3349), and ELECTRA (0.3300) tokenizer
+variants. Result: 0.3378 -- essentially tied with the single best model, no real gain. All three
+share the exact same char_vec block and LogisticRegression classifier, differing only in
+word-level tokenization, so their errors are too correlated for simple averaging to help; would
+need either a learned meta-weighting (not just equal-weight averaging) or more genuinely
+decorrelated base models (e.g. a different classifier family, not just a different tokenizer) to
+get a real ensembling gain here.
+
 ## Frozen decoder (causal) LM embeddings -> plain classifier
 
 New script `experiment_decoder_embedding.py`: embeds each passage with a frozen causal LM

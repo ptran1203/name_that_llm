@@ -186,7 +186,7 @@ def run_cv(clf_factory, name, use_external=False):
         train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
 
         tfidf_fit_texts = pd.concat([train_df['text'], ext_sample['text']], ignore_index=True) if use_external else train_df['text']
-        word_vec, char_vec, _punct_vec = build_vectorizers()
+        word_vec, char_vec, _punct_vec, _func_vec = build_vectorizers()
         X_tfidf_fit = fit_transform(tfidf_fit_texts, word_vec, char_vec, fit=True)
         X_tfidf_val = fit_transform(val_df['text'], word_vec, char_vec, fit=False)
         svd = TruncatedSVD(n_components=SVD_DIM, random_state=fold)
