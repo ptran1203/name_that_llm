@@ -349,7 +349,8 @@ def main():
     config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5,
               "tokenizer_spec": args.tokenizer_spec, "punctuation_ngrams": args.punctuation_ngrams,
               "classifier": args.classifier}
-    run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else "tfidf_lr_" + args.tokenizer_spec.split(":")[0]
+    run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else (
+        "tfidf_lr_" + args.tokenizer_spec.split(":")[0].replace("/", "-"))
     if args.punctuation_ngrams:
         run_name += "_punct"
     if args.classifier != "lr":

@@ -66,6 +66,30 @@ corpus, diluting specificity to our exact 18 official models rather than adding 
 fold result, not exhaustively tuned (one vocab_size only) -- directionally clear enough to
 deprioritize, but not a fully confirmed negative the way a 5-fold result would be.
 
+## Comparing pretrained subword-tokenizer schemes for TF-IDF (follow-up to the DeBERTa-v3 win)
+
+Reusing a pretrained transformer's tokenizer for TF-IDF (`--subword_tokenizer <hf_model_name>`)
+already confirmed a win with DeBERTa-v3 (SentencePiece unigram, 0.3382 full 5-fold vs 0.3086
+plain regex baseline). Tested two more pretrained tokenizers, one per other major subword scheme,　
+full 5-fold CV each:
+
+- `google/electra-base-discriminator` (WordPiece, same vocab family as BERT): 0.3301 +/- 0.0194
+- `Qwen/Qwen2.5-0.5B` (byte-level BPE): 0.3349 +/- 0.0178
+- `microsoft/deberta-v3-base` (SentencePiece unigram, already confirmed): 0.3382 +/- 0.0158
+
+All three beat the plain regex baseline (0.3086) by a clear margin; the gap between the three
+pretrained tokenizers themselves (0.3301-0.3382) is within fold-to-fold noise (+/-0.016-0.019).
+Takeaway: which pretrained tokenizer scheme doesn't matter much on its own -- the win is from
+reusing *any* large-corpus-trained subword vocabulary over this project's own regex word
+tokenization. Since all three span genuinely different segmentation algorithms (unigram LM, BPE,
+WordPiece), they're a reasonable candidate set for ensembling/stacking later (see IDEAS.md #2)
+rather than picking one as "best." Saved OOF probabilities for both new runs
+(`tfidf_lr_google/electra-base-discriminator`, `tfidf_lr_Qwen/Qwen2.5-0.5B` under `experiments/`).
+
+Note: the run-name sanitization bug (HF org-prefixed names like `google/electra-...` leak a `/`
+into the run folder name, creating a nested directory instead of one flat folder) still needs
+fixing in `train.py`'s `run_name` construction -- cosmetic only, didn't affect the results above.
+
 ## Mixup augmentation (feature-space, on TF-IDF)
 `experiment_mixup.py`. Interpolating two same-class TF-IDF vectors at multiplier 1.0 and 2.0:
 0.3049 and 0.3012 CV, both *below* the plain baseline (0.3086). Cause: TF-IDF is topic-driven,
