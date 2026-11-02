@@ -133,7 +133,7 @@ def main():
 
         fold_tfidf_tokenizer = (build_tokenizer_from_spec(args.tfidf_tokenizer).fit(train_df["text"])
                                  if tfidf_tokenizer_refit_per_fold else tfidf_tokenizer)
-        word_vec, char_vec = build_vectorizers(fold_tfidf_tokenizer)
+        word_vec, char_vec, _punct_vec = build_vectorizers(fold_tfidf_tokenizer)  # punctuation n-grams not wired into the fusion yet
         X_tfidf_train = fit_transform(train_df["text"], word_vec, char_vec, fit=True)
         X_tfidf_val = fit_transform(val_df["text"], word_vec, char_vec, fit=False)
         svd = TruncatedSVD(n_components=args.svd_dim, random_state=args.seed)
