@@ -73,6 +73,24 @@ def predict_fold(model, fusion, tokenizer, texts, max_length, batch_size, k):
     svd_feat = svd.transform(X_tfidf)
     stylo_feat = stylometric_matrix(texts)
 
+    # stylometric.py has been extended over time (11 -> 16 features, see git history) -- a
+    # checkpoint saved before such a change expects fewer stylo columns than the CURRENT
+    # stylometric_matrix() produces. Truncate/pad to match so old checkpoints keep working
+    # instead of a cryptic LightGBM feature-count ValueError, but say so loudly: this means
+    # results reflect that checkpoint's OLDER feature set, not the current one. Retrain to
+    # actually pick up newer stylometric features.
+    expected_stylo_dim = lgbm.n_features_ - emb.shape[1] - svd_feat.shape[1]
+    if stylo_feat.shape[1] != expected_stylo_dim:
+        print(f"WARNING: stylometric_matrix() produces {stylo_feat.shape[1]} features, but this "
+              f"saved LGBM model expects {expected_stylo_dim} (trained with a different "
+              f"stylometric.py version). Truncating/padding to match -- retrain this fold to "
+              f"actually use the current stylometric features.")
+        if stylo_feat.shape[1] > expected_stylo_dim:
+            stylo_feat = stylo_feat[:, :expected_stylo_dim]
+        else:
+            pad = np.zeros((stylo_feat.shape[0], expected_stylo_dim - stylo_feat.shape[1]), dtype=stylo_feat.dtype)
+            stylo_feat = np.concatenate([stylo_feat, pad], axis=1)
+
     X_fusion = np.concatenate([emb, svd_feat, stylo_feat], axis=1).astype(np.float32)
 
     fusion_proba = np.zeros((len(texts), k), dtype=np.float32)
