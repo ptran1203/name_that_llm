@@ -6,6 +6,7 @@ experiments/
 submission/*.parquet
 data/test.csv
 data/external/
+data/embed_cache/
 kaggle_package/
 kaggle_code_package/
 .venv/

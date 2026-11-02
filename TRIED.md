@@ -4,6 +4,30 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Frozen decoder (causal) LM embeddings -> plain classifier
+
+New script `experiment_decoder_embedding.py`: embeds each passage with a frozen causal LM
+(no fine-tuning) and fits StandardScaler + LogisticRegression on top, same GroupKFold-by-
+prompt_id discipline as everything else. Qwen2.5-0.5B (896-dim hidden), full 5-fold CV:
+
+- last-token pooling (theoretically correct for causal attention -- only the final token has
+  attended to the whole sequence): 0.2134 +/- 0.0112
+- mean pooling (averages every token's hidden state, including under-informed early tokens that
+  haven't seen the rest of the passage yet): 0.2630 +/- 0.0129
+
+Both clearly below the plain TF-IDF baseline (0.3086) and well below the DeBERTa-v3 encoder
+embeddings (0.3382 as a subword TF-IDF tokenizer; ~0.41-0.44 as frozen/fine-tuned pooled
+embeddings in notebooks/frozen_embeddings.ipynb, though those numbers carry a fold-leakage
+caveat noted elsewhere). First run without StandardScaler also failed to converge (raw causal-LM
+hidden states aren't scale-normalized the way DeBERTa's mean-pooled output is) -- fixed, didn't
+change the conclusion. Mean pooling beating last-token pooling is counter to the "only the last
+token has seen everything" theory; likely explanation: a 0.5B causal model's raw hidden states
+are optimized for next-token prediction, not whole-document semantic compression -- the papers
+that turn decoder LMs into good embedders (LLM2Vec, E5-Mistral) all apply extra contrastive /
+bidirectional-attention fine-tuning before using them this way. A frozen base decoder model
+without that adaptation step is a known weak embedder; not worth pursuing further here without
+that (expensive) extra step.
+
 ## NBSVM (IDEAS.md #7)
 
 `--classifier nbsvm` in `train.py` (Naive-Bayes log-count-ratio feature scaling + one-vs-rest
