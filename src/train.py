@@ -21,6 +21,60 @@ from paths import data_dir
 from exp_log import ExperimentRun
 
 
+class NBSVM:
+    """Multi-class NBSVM (Wang & Manning 2012, "Baselines and Bigrams"), adapted to K-class
+    classification via one-vs-rest: for each class, scale TF-IDF features by that class's
+    Naive-Bayes log-count ratio (log((class-c counts + alpha) / (not-c counts + alpha)), each
+    L1-normalized first) before fitting a binary linear classifier; predict by argmax over the K
+    binary decision scores. Distinct from OneVsRestClassifier(LogisticRegression()), which would
+    reuse the SAME unscaled X for every binary sub-problem -- the whole point of NBSVM is that the
+    scaling itself is class-specific, computed from each class's own word/feature frequencies.
+    (IDEAS.md #7.)"""
+
+    def __init__(self, C=1.0, alpha=1.0, max_iter=2000):
+        self.C = C
+        self.alpha = alpha
+        self.max_iter = max_iter
+
+    def fit(self, X, y, sample_weight=None):
+        X = X.tocsr() if hasattr(X, "tocsr") else X
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        self._ratios = {}
+        self._clfs = {}
+        for c in self.classes_:
+            is_c = (y == c)
+            p = np.asarray(X[is_c].sum(axis=0)).ravel() + self.alpha
+            q = np.asarray(X[~is_c].sum(axis=0)).ravel() + self.alpha
+            r = np.log((p / p.sum()) / (q / q.sum())).reshape(1, -1)
+            self._ratios[c] = r
+            Xc = X.multiply(r).tocsr()
+            clf = LogisticRegression(C=self.C, max_iter=self.max_iter)
+            clf.fit(Xc, is_c.astype(int), sample_weight=sample_weight)
+            self._clfs[c] = clf
+        return self
+
+    def decision_function(self, X):
+        X = X.tocsr() if hasattr(X, "tocsr") else X
+        scores = np.zeros((X.shape[0], len(self.classes_)))
+        for i, c in enumerate(self.classes_):
+            Xc = X.multiply(self._ratios[c]).tocsr()
+            scores[:, i] = self._clfs[c].decision_function(Xc)
+        return scores
+
+    def predict_proba(self, X):
+        # softmax over the K binary decision scores -- not calibrated probabilities in a strict
+        # sense (each score comes from an independent binary classifier, not a shared softmax
+        # objective), but good enough for argmax prediction and for OOF-proba-based ensembling
+        # alongside our other models' outputs.
+        scores = self.decision_function(X)
+        exp = np.exp(scores - scores.max(axis=1, keepdims=True))
+        return exp / exp.sum(axis=1, keepdims=True)
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.decision_function(X), axis=1)]
+
+
 def identity_preprocessor(text):
     # Disables TfidfVectorizer's default lowercasing when a subword tokenizer is in use: HF
     # tokenizers expect natural-case input (vocab often distinguishes cased forms), and casing
@@ -197,11 +251,19 @@ def fit_transform(texts, word_vec, char_vec, punct_vec=None, fit=True):
     return hstack(parts).tocsr()
 
 
-def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuation_ngrams=False):
+def default_clf_factory():
+    return LogisticRegression(max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1)
+
+
+def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
+                    clf_factory=default_clf_factory):
     """Returns (scores, oof_proba, class_labels) -- oof_proba is [n_rows, n_classes], aligned to
     df's row order (np.nan where a row was never in a val fold, shouldn't happen with the full
-    GroupKFold split). Saved by main() so different tokenizer_spec runs produce comparable,
-    stackable OOF artifacts for later ensembling across tokenizer variants, not just a final score."""
+    GroupKFold split). Saved by main() so different tokenizer_spec/clf_factory runs produce
+    comparable, stackable OOF artifacts for later ensembling across variants, not just a score.
+    clf_factory: zero-arg callable returning a fresh, unfitted classifier each call (fit(X, y,
+    sample_weight=None) + predict_proba(X)) -- same plug-and-play pattern as tokenizer_spec, so
+    swapping classifiers (e.g. NBSVM) reuses this harness instead of a one-off script."""
     # Pretrained tokenizers (SubwordTokenizer) have a fold-independent vocabulary -- load once,
     # reuse every fold (AutoTokenizer.from_pretrained has real cost, no need to pay it 5x).
     # CustomBPETokenizer's vocabulary is LEARNED from texts, so it must be rebuilt per fold from
@@ -230,9 +292,7 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
         X_train = fit_transform(train_df["text"], word_vec, char_vec, punct_vec, fit=True)
         X_val = fit_transform(val_df["text"], word_vec, char_vec, punct_vec, fit=False)
 
-        clf = LogisticRegression(
-            max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1
-        )
+        clf = clf_factory()
         clf.fit(X_train, train_df["model"])
         fold_proba = np.zeros((len(val_df), len(class_labels)), dtype=np.float32)
         fold_proba[:, [label2id[c] for c in clf.classes_]] = clf.predict_proba(X_val)
@@ -246,13 +306,14 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
     return scores, oof_proba, class_labels
 
 
-def fit_final(df, artifact_path, log=print, tokenizer_spec=None, use_punctuation_ngrams=False):
+def fit_final(df, artifact_path, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
+              clf_factory=default_clf_factory):
     tokenizer = build_tokenizer_from_spec(tokenizer_spec)
     if tokenizer is not None:
         tokenizer.fit(df["text"])
     word_vec, char_vec, punct_vec = build_vectorizers(tokenizer, use_punctuation_ngrams)
     X = fit_transform(df["text"], word_vec, char_vec, punct_vec, fit=True)
-    clf = LogisticRegression(max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1)
+    clf = clf_factory()
     clf.fit(X, df["model"])
     joblib.dump({"word_vec": word_vec, "char_vec": char_vec, "punct_vec": punct_vec, "clf": clf}, artifact_path)
     log(f"saved final model to {artifact_path}")
@@ -277,19 +338,28 @@ def main():
                           "char_vec's char_wb n-grams (punctuation drowned out by surrounding "
                           "letters). PAN research found this adds signal for authorship "
                           "attribution specifically (IDEAS.md #9). Untested here.")
+    ap.add_argument("--classifier", default="lr", choices=["lr", "nbsvm"],
+                     help="lr (default) = LogisticRegression(C=5.0, class_weight='balanced'). "
+                          "nbsvm = NBSVM (IDEAS.md #7): scales TF-IDF features by each class's "
+                          "Naive-Bayes log-count ratio before a one-vs-rest linear classifier, "
+                          "instead of raw/plain TF-IDF weights. Untested here.")
     args = ap.parse_args()
+    clf_factory = (lambda: NBSVM(C=1.0, max_iter=2000)) if args.classifier == "nbsvm" else default_clf_factory
 
     config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5,
-              "tokenizer_spec": args.tokenizer_spec, "punctuation_ngrams": args.punctuation_ngrams}
+              "tokenizer_spec": args.tokenizer_spec, "punctuation_ngrams": args.punctuation_ngrams,
+              "classifier": args.classifier}
     run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else "tfidf_lr_" + args.tokenizer_spec.split(":")[0]
     if args.punctuation_ngrams:
         run_name += "_punct"
+    if args.classifier != "lr":
+        run_name += "_" + args.classifier
     run = ExperimentRun(run_name, config=config)
 
     df = pd.read_csv(data_dir() / "train.csv")
     scores, oof_proba, class_labels = cross_validate(
         df, n_splits=config["n_splits"], log=run.log, tokenizer_spec=args.tokenizer_spec,
-        use_punctuation_ngrams=args.punctuation_ngrams,
+        use_punctuation_ngrams=args.punctuation_ngrams, clf_factory=clf_factory,
     )
     run.log_scores("balanced_accuracy", scores)
     np.save(run.artifact_path("oof_proba.npy"), oof_proba)
@@ -299,7 +369,8 @@ def main():
     run.log(f"saved OOF predictions -> oof.csv, oof_proba.npy ({len(class_labels)} classes)")
 
     fit_final(df, run.artifact_path("baseline.joblib"), log=run.log,
-              tokenizer_spec=args.tokenizer_spec, use_punctuation_ngrams=args.punctuation_ngrams)
+              tokenizer_spec=args.tokenizer_spec, use_punctuation_ngrams=args.punctuation_ngrams,
+              clf_factory=clf_factory)
 
 
 if __name__ == "__main__":

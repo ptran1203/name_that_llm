@@ -136,6 +136,11 @@ Regression, instead of using raw/plain TF-IDF weights as `train.py` does now. Wa
 Kaggle kernel for the Jigsaw Toxic Comment competition. Cheap: one extra transform step before
 `.fit()`, no architecture change. See COMPETITION_RESEARCH.md for sources.
 
+> **TRIED — negative, see TRIED.md.** Full 5-fold CV: 0.2804, worse than plain LR (0.3086), and
+> the highest fold-to-fold variance seen on this harness. Likely the one-vs-rest framing (18
+> independent binary classifiers, smaller effective per-class sample each) makes our small-data
+> problem worse, not better -- NBSVM's reputation comes from larger text-classification datasets.
+
 ## 8. Corpus-specific BPE tokenizer (trained from scratch) for TF-IDF
 
 We confirmed reusing a *pretrained* transformer's subword tokenizer (DeBERTa-v3) for TF-IDF

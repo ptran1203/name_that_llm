@@ -4,6 +4,39 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## NBSVM (IDEAS.md #7)
+
+`--classifier nbsvm` in `train.py` (Naive-Bayes log-count-ratio feature scaling + one-vs-rest
+linear classifier, instead of plain LogisticRegression on raw TF-IDF). Full 5-fold CV: 0.2804,
+worse than the plain baseline (0.3086), and the highest fold-to-fold variance seen on this
+harness (+/- 0.0200 vs +/- 0.0159 for plain LR). Plausible cause: NBSVM's one-vs-rest framing
+fits 18 independent binary classifiers, each on a much smaller effective positive-class sample
+(~150 rows) than the shared 18-way LogisticRegression gets to use jointly -- likely makes our
+already-severe small-data problem worse, not better, despite NBSVM's reputation as a strong
+linear baseline on larger text-classification datasets (its original competition write-ups were
+on far larger corpora).
+
+## External-data confidence-mismatch filtering: naive flag-rate is contaminated by model bias
+
+`filter_external_data.py`, scoring ntl_open_pool.parquet (500/class, 9000 rows) with the best
+fusion_lgbm run's 5-fold ensemble. Flagged 48.8% of rows as "confident mismatches" (model
+confidently predicts a different class than claimed) -- but inspecting *which* class the model
+confidently predicts, `gpt-6-astra` alone accounts for 825/4395 flags across many different
+claimed classes, and `claude-opus-5` for another 377 -- a clear attractor pattern (the model
+defaults toward these classes when uncertain), not evidence of real per-row mislabeling. Read two
+of the flagged passages by hand (claimed gpt-5.6-terra, "confidently" predicted gpt-6-astra,
+0.93 and 0.56 top-other-prob) -- both are normal, well-formed passages with nothing that reads as
+mislabeled. Likely cause: distribution shift between official train (what the model was fit on)
+and this external corpus (different topic/style mix) makes the model's confidence poorly
+calibrated out-of-distribution, and that miscalibration masquerades as "confident disagreement."
+
+**Do not use the raw flag rate as a hard filter.** The mechanism (script, confident-vs-uncertain
+distinction) is sound and kept for later use, but needs a refinement before trusting it: e.g.
+exclude flags whose top-other-label is itself a suspiciously high-frequency attractor across many
+different claimed classes (a real mismatch should point to a specific, varied set of confusable
+classes, not the same 1-2 classes constantly), or recalibrate per-class confidence on a held-out
+official-data sample before applying this to external data. Not reattempted without that fix.
+
 ## Punctuation n-grams as a dedicated TF-IDF channel (IDEAS.md #9)
 
 `--punctuation_ngrams` in `train.py` (char n-gram 1-3 TF-IDF over just the punctuation stream,
