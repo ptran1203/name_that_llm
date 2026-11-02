@@ -43,6 +43,13 @@ class SubwordTokenizer:
             from transformers import AutoTokenizer
             self._tok = AutoTokenizer.from_pretrained(self.model_name)
 
+    def fit(self, texts):
+        # No-op (the vocabulary is fixed/pretrained, not learned from texts) -- exists only so
+        # callers can treat every tokenizer type uniformly via .fit(corpus) before use, same as
+        # CustomBPETokenizer, without needing to know which kind they have.
+        self._ensure_loaded()
+        return self
+
     def __call__(self, text):
         self._ensure_loaded()
         return self._tok.tokenize(text)
@@ -92,6 +99,34 @@ class CustomBPETokenizer:
             self._tok = Tokenizer.from_str(state["tok_json"])
 
 
+def build_tokenizer_from_spec(spec):
+    """Single entry point for picking a word-level tokenizer by a plain string, so every script
+    (train.py, train_fusion_lgbm.py, ...) and any later ensemble sweep selects one the same way
+    instead of each wiring its own if/else. Adding a new tokenizer type later = one more branch
+    here, not a new CLI flag/code path per script.
+
+    spec:
+      None / '' -> None (default: original regex word tokenization, no custom tokenizer)
+      'bpe:<vocab_size>' -> CustomBPETokenizer(vocab_size) -- must .fit(corpus) before use (its
+        vocabulary is learned from texts, not fixed), so needs_refit(spec) is True for this case
+      anything else -> SubwordTokenizer(spec), a pretrained HF tokenizer by model name (e.g.
+        'microsoft/deberta-v3-base') -- backward compatible with the original --subword_tokenizer
+        contract, which only ever took a bare HF model name.
+    """
+    if not spec:
+        return None
+    if spec.startswith("bpe:"):
+        return CustomBPETokenizer(vocab_size=int(spec.split(":", 1)[1]))
+    return SubwordTokenizer(spec)
+
+
+def tokenizer_needs_refit(spec):
+    """True if build_tokenizer_from_spec(spec) returns an object whose vocabulary must be
+    .fit() per-fold on that fold's own train text (CustomBPETokenizer) rather than loaded once
+    and reused across folds (SubwordTokenizer's pretrained vocab is fold-independent)."""
+    return bool(spec) and spec.startswith("bpe:")
+
+
 def build_vectorizers(subword_tokenizer=None):
     if subword_tokenizer is not None:
         # Subword vocabulary comes from large external pretraining (BPE/SentencePiece), not fit
@@ -133,10 +168,24 @@ def fit_transform(texts, word_vec, char_vec, fit=True):
     return hstack([xw, xc]).tocsr()
 
 
-def cross_validate(df, n_splits=5, log=print, subword_tokenizer_name=None):
-    # Loaded once, reused every fold -- AutoTokenizer.from_pretrained has real cost, no need to
-    # pay it 5x. SubwordTokenizer lazy-loads on first call, so this is cheap until actually used.
-    subword_tokenizer = SubwordTokenizer(subword_tokenizer_name) if subword_tokenizer_name else None
+def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None):
+    """Returns (scores, oof_proba, class_labels) -- oof_proba is [n_rows, n_classes], aligned to
+    df's row order (np.nan where a row was never in a val fold, shouldn't happen with the full
+    GroupKFold split). Saved by main() so different tokenizer_spec runs produce comparable,
+    stackable OOF artifacts for later ensembling across tokenizer variants, not just a final score."""
+    # Pretrained tokenizers (SubwordTokenizer) have a fold-independent vocabulary -- load once,
+    # reuse every fold (AutoTokenizer.from_pretrained has real cost, no need to pay it 5x).
+    # CustomBPETokenizer's vocabulary is LEARNED from texts, so it must be rebuilt per fold from
+    # that fold's own train text only -- same leakage discipline as word_vec/char_vec already
+    # being refit per fold.
+    refit_per_fold = tokenizer_needs_refit(tokenizer_spec)
+    shared_tokenizer = None if refit_per_fold else build_tokenizer_from_spec(tokenizer_spec)
+    if shared_tokenizer is not None:
+        shared_tokenizer.fit(df["text"])
+
+    class_labels = sorted(df["model"].unique())
+    label2id = {l: i for i, l in enumerate(class_labels)}
+    oof_proba = np.full((len(df), len(class_labels)), np.nan, dtype=np.float32)
 
     gkf = GroupKFold(n_splits=n_splits)
     scores = []
@@ -145,7 +194,10 @@ def cross_validate(df, n_splits=5, log=print, subword_tokenizer_name=None):
     ):
         train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
 
-        word_vec, char_vec = build_vectorizers(subword_tokenizer)
+        tokenizer = (build_tokenizer_from_spec(tokenizer_spec).fit(train_df["text"])
+                     if refit_per_fold else shared_tokenizer)
+
+        word_vec, char_vec = build_vectorizers(tokenizer)
         X_train = fit_transform(train_df["text"], word_vec, char_vec, fit=True)
         X_val = fit_transform(val_df["text"], word_vec, char_vec, fit=False)
 
@@ -153,18 +205,23 @@ def cross_validate(df, n_splits=5, log=print, subword_tokenizer_name=None):
             max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1
         )
         clf.fit(X_train, train_df["model"])
-        preds = clf.predict(X_val)
+        fold_proba = np.zeros((len(val_df), len(class_labels)), dtype=np.float32)
+        fold_proba[:, [label2id[c] for c in clf.classes_]] = clf.predict_proba(X_val)
+        oof_proba[val_idx] = fold_proba
 
-        score = balanced_accuracy_score(val_df["model"], preds)
+        pred_labels = [class_labels[i] for i in np.argmax(fold_proba, axis=-1)]
+        score = balanced_accuracy_score(val_df["model"], pred_labels)
         scores.append(score)
         log(f"fold {fold}: balanced_accuracy={score:.4f}")
 
-    return scores
+    return scores, oof_proba, class_labels
 
 
-def fit_final(df, artifact_path, log=print, subword_tokenizer_name=None):
-    subword_tokenizer = SubwordTokenizer(subword_tokenizer_name) if subword_tokenizer_name else None
-    word_vec, char_vec = build_vectorizers(subword_tokenizer)
+def fit_final(df, artifact_path, log=print, tokenizer_spec=None):
+    tokenizer = build_tokenizer_from_spec(tokenizer_spec)
+    if tokenizer is not None:
+        tokenizer.fit(df["text"])
+    word_vec, char_vec = build_vectorizers(tokenizer)
     X = fit_transform(df["text"], word_vec, char_vec, fit=True)
     clf = LogisticRegression(max_iter=2000, C=5.0, class_weight="balanced", n_jobs=-1)
     clf.fit(X, df["model"])
@@ -174,24 +231,36 @@ def fit_final(df, artifact_path, log=print, subword_tokenizer_name=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--subword_tokenizer", default=None,
-                     help="HF model name whose tokenizer replaces the default regex word-"
-                          "splitter for the word-level TF-IDF vectorizer, e.g. "
-                          "microsoft/deberta-v3-base. None (default) = original regex word "
-                          "tokenization.")
+    ap.add_argument("--subword_tokenizer", default=None, dest="tokenizer_spec",
+                     help="word-level tokenizer for TF-IDF, via build_tokenizer_from_spec(): a "
+                          "bare HF model name reuses its pretrained tokenizer (e.g. "
+                          "microsoft/deberta-v3-base, confirmed +0.03 balanced accuracy over the "
+                          "default), 'bpe:<vocab_size>' trains a BPE vocabulary from scratch on "
+                          "this run's own data (e.g. bpe:5000 -- tested negative on fold 0, see "
+                          "TRIED.md). None (default) = original regex word tokenization. Saves "
+                          "OOF probabilities (oof_proba.npy) either way, so runs with different "
+                          "tokenizer_spec values produce comparable, stackable artifacts for "
+                          "later ensembling across tokenizer variants.")
     args = ap.parse_args()
 
     config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5,
-              "subword_tokenizer": args.subword_tokenizer}
-    run_name = "tfidf_lr_baseline" if not args.subword_tokenizer else "tfidf_lr_subword"
+              "tokenizer_spec": args.tokenizer_spec}
+    run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else "tfidf_lr_" + args.tokenizer_spec.split(":")[0]
     run = ExperimentRun(run_name, config=config)
 
     df = pd.read_csv(data_dir() / "train.csv")
-    scores = cross_validate(df, n_splits=config["n_splits"], log=run.log,
-                             subword_tokenizer_name=args.subword_tokenizer)
+    scores, oof_proba, class_labels = cross_validate(
+        df, n_splits=config["n_splits"], log=run.log, tokenizer_spec=args.tokenizer_spec
+    )
     run.log_scores("balanced_accuracy", scores)
+    np.save(run.artifact_path("oof_proba.npy"), oof_proba)
+    oof = df[["id", "prompt_id", "model"]].rename(columns={"model": "true_label"}).copy()
+    oof["pred"] = [class_labels[i] for i in np.argmax(oof_proba, axis=-1)]
+    oof.to_csv(run.artifact_path("oof.csv"), index=False)
+    run.log(f"saved OOF predictions -> oof.csv, oof_proba.npy ({len(class_labels)} classes)")
+
     fit_final(df, run.artifact_path("baseline.joblib"), log=run.log,
-              subword_tokenizer_name=args.subword_tokenizer)
+              tokenizer_spec=args.tokenizer_spec)
 
 
 if __name__ == "__main__":

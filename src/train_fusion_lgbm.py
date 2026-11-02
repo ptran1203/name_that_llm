@@ -28,7 +28,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from exp_log import ExperimentRun
 from paths import data_dir
 from stylometric import stylometric_matrix
-from train import SubwordTokenizer, build_vectorizers, fit_transform
+from train import build_tokenizer_from_spec, build_vectorizers, fit_transform, tokenizer_needs_refit
 from train_transformer import TextDataset, build_curve, make_trainer
 
 
@@ -72,20 +72,26 @@ def main():
     ap.add_argument("--svd_dim", type=int, default=150)
     ap.add_argument("--checkpoint_dir", default=None,
                      help="reuse a previous run's fold checkpoints (experiments/<run_id>) instead of retraining")
-    ap.add_argument("--subword_tokenizer", default=None,
-                     help="HF model name whose tokenizer replaces the default regex word-"
-                          "splitter for the TF-IDF side of the fusion (see train.py). Confirmed "
-                          "+0.03 balanced accuracy on the plain TF-IDF+LR baseline (0.3382 vs "
-                          "0.3086, consistent across all 5 folds); untested here yet.")
+    ap.add_argument("--tfidf_tokenizer", default=None,
+                     help="word-level tokenizer for the TF-IDF side of the fusion, via "
+                          "build_tokenizer_from_spec() in train.py (same spec syntax as that "
+                          "script's --subword_tokenizer): a bare HF model name reuses its "
+                          "pretrained tokenizer (confirmed +0.03 balanced accuracy on the plain "
+                          "TF-IDF+LR baseline), 'bpe:<vocab_size>' trains from scratch (tested "
+                          "negative on fold 0 there, see TRIED.md). None (default) = original "
+                          "regex word tokenization. Untested in this fusion script either way.")
     args = ap.parse_args()
 
     run = ExperimentRun("fusion_lgbm", config=vars(args))
-    subword_tokenizer = SubwordTokenizer(args.subword_tokenizer) if args.subword_tokenizer else None
+    tfidf_tokenizer_refit_per_fold = tokenizer_needs_refit(args.tfidf_tokenizer)
+    tfidf_tokenizer = None if tfidf_tokenizer_refit_per_fold else build_tokenizer_from_spec(args.tfidf_tokenizer)
 
     df = pd.read_csv(data_dir() / "train.csv")
     labels_sorted = sorted(df["model"].unique())
     label2id = {l: i for i, l in enumerate(labels_sorted)}
     df["label"] = df["model"].map(label2id)
+    if tfidf_tokenizer is not None:
+        tfidf_tokenizer.fit(df["text"])
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     tokenizer.save_pretrained(run.artifact_path("tokenizer"))
@@ -125,7 +131,9 @@ def main():
         transformer_scores.append(t_score)
         run.log(f"fold {fold}: transformer_only={t_score:.4f}")
 
-        word_vec, char_vec = build_vectorizers(subword_tokenizer)
+        fold_tfidf_tokenizer = (build_tokenizer_from_spec(args.tfidf_tokenizer).fit(train_df["text"])
+                                 if tfidf_tokenizer_refit_per_fold else tfidf_tokenizer)
+        word_vec, char_vec = build_vectorizers(fold_tfidf_tokenizer)
         X_tfidf_train = fit_transform(train_df["text"], word_vec, char_vec, fit=True)
         X_tfidf_val = fit_transform(val_df["text"], word_vec, char_vec, fit=False)
         svd = TruncatedSVD(n_components=args.svd_dim, random_state=args.seed)
