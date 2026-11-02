@@ -4,6 +4,36 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Trained pairwise same-model verifier (IDEAS.md #6 Step 2, user-proposed)
+
+`experiment_pairwise_verifier.py`: concatenate two passages into one text, TF-IDF it (same
+word_vec/char_vec as the main pipeline), train a binary LogisticRegression to predict whether the
+two passages came from the same model. Different-model negative pairs were deliberately
+oversampled from WITHIN known hard confusion clusters (claude/glm, gpt-5.6 triplet, gemini
+triplet) to make the task harder than average, not easier. Unlike IDEAS.md #6 Step 1 (zero-
+training raw-embedding cosine similarity, which failed outright at 0.17-0.20 on the 18-way
+reduction), this is an actually-trained classifier -- a materially different approach.
+
+Full 5-fold CV on the binary same/diff task: AUC 0.5552 +/- 0.0061, balanced accuracy 0.5390 +/-
+0.0047. Consistently above chance (every fold's AUC in a tight 0.545-0.564 band, so this is real
+signal, not noise) but weak in absolute terms -- even with an actual classifier instead of a
+zero-training baseline, there just isn't much same/author-vs-different-author signal available
+in these passages beyond what the 18-way classifier already captures. Not pursued further into
+an 18-way nearest-prototype conversion (IDEAS.md #6's staged next step) given how weak the base
+signal is -- would need a much stronger standalone AUC to be worth that extra engineering.
+
+## Text-level splicing augmentation (IDEAS.md #1's untried variant, user-proposed)
+
+`experiment_splice_augmentation.py`: concatenate two same-model passages' raw text into one
+synthetic training row (label unchanged), as opposed to `experiment_mixup.py`'s feature-space
+interpolation (already tried, negative). Full 5-fold CV, multiplier=1.0 (doubles the training
+set): plain 0.3086 -> spliced 0.3008 (worse, 4/5 folds down). Consistent with the risk flagged in
+IDEAS.md #1 itself: the splice boundary introduces an artificial discontinuity (sentence-length/
+punctuation jump) a real single-author passage would never have, and the TF-IDF vocabulary
+fit on the augmented set picks up a few splice-boundary n-gram artifacts. Confirms mixup's
+feature-space blend (which avoids a literal text discontinuity) was the right call over this
+riskier variant, as IDEAS.md #1 already anticipated.
+
 ## Function-word TF-IDF as a dedicated feature channel
 
 `--function_words` in `train.py`: a word-level TF-IDF block restricted to a fixed ~140-word

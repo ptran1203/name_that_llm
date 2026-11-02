@@ -18,7 +18,9 @@ model (so the label stays valid), to cheaply grow the effective dataset beyond 1
   that only helps train-loss but not held-out balanced accuracy isn't worth the complexity.
 
 > **TRIED — negative, see TRIED.md.** Feature-space mixup on TF-IDF tested at two multipliers,
-> both below the plain baseline. Text-level splicing never implemented.
+> both below the plain baseline. Text-level splicing now also TRIED — negative (0.3086 -> 0.3008),
+> confirming the risk flagged above: the splice boundary artifact cost more than the extra
+> synthetic data added.
 
 ## 2. Stack a fine-tuned encoder (RoBERTa/DeBERTa) with TF-IDF for ensembling
 
@@ -127,6 +129,14 @@ untried on this problem so far.
 > baseline scored 0.17-0.20 across variants, well below trained classifiers (~0.39-0.41). Per
 > the staged plan, this was the gate for Step 2 (learned pairwise verifier) — result says raw
 > embedding similarity doesn't carry enough signal on its own, so Step 2 was not attempted.
+>
+> **Step 2 TRIED anyway — weak, see TRIED.md.** User-proposed revisit: trained (not zero-shot)
+> binary same-model classifier on concatenated-pair TF-IDF, hard negatives from the known
+> confusion clusters. AUC 0.555, balanced accuracy 0.539 full 5-fold -- consistently above
+> chance (real signal, low variance) but too weak to be worth converting into an 18-way
+> nearest-prototype classifier. Confirms Step 1's pessimism from a different angle: a trained
+> classifier does slightly better than raw cosine similarity, but the ceiling on same/different-
+> author signal in these passages is low either way.
 
 ## 7. NBSVM (Naive Bayes-weighted TF-IDF)
 
