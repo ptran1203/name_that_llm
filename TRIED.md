@@ -4,6 +4,45 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Prompt-cluster detection + rank-based conflict resolution (IDEAS.md #5 revisited)
+
+`prompt_cluster_assign.py`, wired into `predict.py` via `--cluster_assign`/`--cluster_threshold`.
+Detects which test passages likely share a hidden prompt via TF-IDF cosine similarity
+(connected components above a threshold), then resolves within-cluster label conflicts by
+confidence rank (sort all (row, class) candidates by probability, assign greedily, skip if the
+row or class is already taken) -- falls back to plain argmax for singleton or oversized
+(>18-member, likely a false merge) clusters.
+
+**Oracle test** (using TRUE prompt_id, not detected): on the plain TF-IDF+LR baseline's OOF
+(0.3382), Hungarian-optimal assignment within each true 18-member prompt group scores 0.4453
+(+0.107); greedy rank-based scores 0.3905 (+0.052). This confirmed the underlying mechanism
+genuinely works when the grouping is known -- by far the single largest number seen all session.
+
+**Threshold calibration** (train's real prompt_id as ground truth for the DETECTOR itself, not
+just the downstream classifier): same-prompt pairs have TF-IDF cosine similarity mean=0.238
+(min=0.024), different-prompt pairs mean=0.048 (max=0.298) -- real separation, but overlapping
+tails. Low thresholds (<0.20) chain into one giant connected component via transitive merging
+(max_cluster_size=2699 at threshold=0.10!) -- single-linkage chaining is a real failure mode
+here. Threshold=0.22-0.24 is the sweet spot: precision ~0.994-0.997 (almost no false-positive
+edges), recall ~0.83-0.90, zero-to-few oversized (>18) components.
+
+**Realistic test** (detected clusters, no ground truth, applied to actual OOF probabilities):
+- Plain TF-IDF+LR baseline (0.3382): threshold=0.22 -> 0.3838 (+0.046). Large, genuine gain even
+  without oracle knowledge.
+- fusion_lgbm, the actual best/submitted model (0.3482): threshold=0.24 -> 0.3527 (+0.0045) is
+  the best found; threshold=0.20 -> 0.3464 (-0.0018); threshold=0.28-0.35 all slightly NEGATIVE
+  (-0.003 to -0.009). Sign-unstable across nearby thresholds -- this is noise-level, not a robust
+  signal, on the model that matters.
+
+**Why the gain shrinks on the stronger model**: a weak classifier leaves many "two cluster
+members both got argmax'd to the same wrong class" conflicts on the table for rank-resolution to
+fix for free. A stronger classifier (richer features: transformer embedding + SVD-TFIDF +
+stylometric) already resolves most of those correctly per-row, leaving much less easily-fixable
+conflict behind -- the free lunch shrinks as the base model improves. Shipped as a low-risk,
+default-off opt-in (`--cluster_assign`) rather than a confirmed win: near-1.0 detector precision
+means it's very unlikely to actively hurt, but the realistic expected gain on the model we'd
+actually submit is small and not fully reliable in sign.
+
 ## Trained pairwise same-model verifier (IDEAS.md #6 Step 2, user-proposed)
 
 `experiment_pairwise_verifier.py`: concatenate two passages into one text, TF-IDF it (same

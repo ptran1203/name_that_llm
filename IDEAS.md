@@ -89,6 +89,20 @@ theory on why (the gates likely inherit the same p>>n overfitting as the base cl
   leaderboard" -- contradicts the clean "every model answers every prompt exactly once"
   structure this depended on. The hard-constraint version is very likely not viable; the
   near-duplicate-detection safety net (last bullet below) is unaffected by this and still fine.
+
+> **Revisited and TRIED, see TRIED.md.** User-proposed follow-up: don't require the full
+> bijective structure -- just detect same-prompt clusters via TF-IDF similarity (calibrated
+> against train's real prompt_id) and resolve within-cluster label conflicts by rank, falling
+> back to plain argmax wherever no confident cluster is found. On an oracle basis (using TRUE
+> prompt_id groups), this is huge: 0.3382 -> 0.4453 (Hungarian) / 0.3905 (greedy rank). With
+> REAL similarity-detected clusters (no ground truth) on that same weak baseline: 0.3382 ->
+> 0.3838 -- still a large, genuine win. But on the actual best model (fusion_lgbm, 0.3482): only
+> +0.004-0.005 at the best threshold, and sign-unstable (can go slightly negative) at nearby
+> thresholds -- a stronger base classifier leaves much less of this particular kind of
+> easily-fixable conflict behind. Implemented as an opt-in post-processing step
+> (`prompt_cluster_assign.py`, `predict.py --cluster_assign`) rather than a sure thing -- low
+> risk (near-1.0 precision at the calibrated threshold means it rarely forces a wrong
+> constraint), modest and uncertain upside on the model we'd actually submit.
 - **Free safety net**: similarity search between train and the hidden test set for
   near-duplicates (quote reuse, accidental leakage). Cheap, zero downside, unlikely to hit
   but free correct labels if it ever does.
