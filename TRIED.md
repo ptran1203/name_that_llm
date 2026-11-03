@@ -4,6 +4,40 @@ Negative/neutral results, kept so we don't re-attempt them later without a genui
 (See IDEAS.md for the untried backlog, and experiments/ + `compare_experiments.py` for the raw
 numbers behind the ones that *did* work.)
 
+## Layer-wise frozen embedding sweep: encoder vs decoder, and embedding-specialized models
+
+`experiment_decoder_embedding.py`, extended to support `--architecture encoder` (AutoModel, not
+AutoModelForCausalLM) and `--pooling cls` alongside mean/last_token. Full 5-fold CV, last layer
+unless noted, mean pooling unless noted:
+
+**Layer sweep, DeBERTa-v3-base (encoder, 12 layers) vs Qwen2.5-3B (decoder, 36 layers):**
+opposite patterns. Encoder: last layer best (0.3690), monotonically-ish worse toward earlier
+layers (L9=0.3305, L6=0.3301, L3=0.3353, L1=0.3130, embedding-only=0.3064). Decoder: an early-
+middle layer (L7, ~19% depth) is dramatically best (0.3978) -- the single best result all
+session for one model -- while the LAST layer is worst (0.2893), beaten even by the raw
+embedding-output layer (0.3464). Consistent with the different pretraining objectives: MLM/RTD
+(bidirectional, builds toward a refined final representation) vs next-token prediction
+(causal, over-specializes the final layer for a narrow task that isn't ours). Confirms our
+existing use of last-layer encoder embeddings throughout the project was already the right
+call, and validates the public top solution's choice of middle decoder layers (their Qwen3-8B
+L7+L22 picks include the exact layer that peaked here independently).
+
+**CLS-token pooling vs mean pooling, DeBERTa-v3-base, last layer:** 0.3690 (mean) -> 0.3109
+(CLS) -- mean pooling wins; committing to one token loses information averaging keeps.
+
+**Embedding-specialized models (contrastive-trained for semantic retrieval/similarity), each
+with its own recommended native pooling:** BAAI/bge-base-en-v1.5 (CLS) 0.1586; intfloat/e5-
+base-v2 (mean) 0.1712; sentence-transformers/all-mpnet-base-v2 (mean) 0.1300. All three land
+dramatically below even the plain TF-IDF baseline (0.3086), not just below DeBERTa's 0.3690 --
+too large a gap to be noise. Likely mechanism: these models are trained via contrastive
+learning specifically to make semantically-similar text embed close together REGARDLESS OF
+PHRASING -- exactly the opposite of what authorship attribution needs (sensitivity to HOW
+something is said, invariance to WHAT it's about). Their training objective actively works
+against this task by construction, not by accident. A raw MLM-pretrained encoder that was never
+taught to suppress stylistic variation is the better transfer source here. (Caveat: E5 wasn't
+tested with its documented "query:"/"passage:" prefix convention -- unlikely to close a gap this
+large, but noted for completeness.)
+
 ## Prompt-cluster detection + rank-based conflict resolution (IDEAS.md #5 revisited)
 
 `prompt_cluster_assign.py`, wired into `predict.py` via `--cluster_assign`/`--cluster_threshold`.

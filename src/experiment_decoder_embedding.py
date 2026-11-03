@@ -1,14 +1,20 @@
-"""Frozen decoder (causal) LM embeddings -> plain classifier.
+"""Frozen (no fine-tuning) layer-wise embeddings -> plain classifier, for EITHER a decoder
+(causal) model or an encoder (bidirectional) model.
 
-Alternative embedding source to the encoder (DeBERTa-v3) mean-pooled embeddings already tested
-in notebooks/frozen_embeddings.ipynb. Encoder models use bidirectional attention, so every
-token has already seen the whole sequence and mean-pooling makes sense. Causal/decoder models
-only attend backward, so only the LAST token has seen the entire passage -- earlier tokens are
-under-informed. Pool via that last real token's hidden state instead (same approach as
-decoder-based embedding models like E5-Mistral/LLM2Vec/GritLM), using left-padding so the last
-real token is reliably at index -1 for every row in a batch, no per-row index gathering needed.
+Why sweep layers at all: the LAST layer isn't automatically the best one for a transfer/probing
+task like this -- it's whatever the pretraining objective favors, which for a causal LM is
+next-token prediction specifically (very task-specific, found empirically worse here: 0.29 at
+the last layer vs 0.40 at an early-middle layer for Qwen2.5-3B, non-monotonic). For an encoder,
+every layer already has full bidirectional context, but the SAME "last layer overfits to the
+pretraining objective" argument could still apply (e.g. masked-token prediction specifics) --
+untested before this script, since notebooks/frozen_embeddings.ipynb only ever pooled the final
+layer. This script checks both architectures with the same harness.
 
-Embeddings are extracted ONCE (frozen, no fine-tuning -- depends only on text, not on fold
+Pooling: mean over all real (non-padding) tokens, masked correctly regardless of pad side --
+found better than last-token pooling for causal models (an earlier small-model test), and is
+the standard choice for encoders regardless (every token already has full context either way).
+
+Embeddings are extracted ONCE per (model, layer) (frozen -- depends only on text, not on fold
 assignment), then GroupKFold-by-prompt_id CV just fits a plain classifier on them, same
 leakage discipline as train.py.
 """
@@ -23,7 +29,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from exp_log import ExperimentRun
 from paths import data_dir
@@ -32,25 +38,25 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def extract_decoder_embeddings(model_name, texts, max_length=256, batch_size=16, log=print,
-                                pooling="last_token", layers=(-1,)):
-    """pooling='last_token': theoretically correct for causal attention -- only the final real
-    token has seen the whole sequence. pooling='mean' (default here): averages every token's
-    hidden state anyway -- found better than last_token in an earlier small-model test (IDEAS.md
-    reference notebook research), consistent with public solutions using mean-pooled hidden
-    states rather than last-token.
+                                pooling="mean", layers=(-1,), architecture="causal"):
+    """architecture='causal' (AutoModelForCausalLM, e.g. Qwen) or 'encoder' (AutoModel, e.g.
+    DeBERTa/RoBERTa/ELECTRA) -- same layer-sweep + pooling logic either way, since mean-pooling
+    with the attention mask is correct regardless of padding side or attention direction.
 
     layers: which hidden_states indices to extract (0 = embedding output, 1..num_layers = each
     transformer block's output, negative counts from the end). Extracts ALL requested layers in
-    ONE forward pass per batch -- a 3B+ model is too expensive to reload per layer. Public
+    ONE forward pass per batch -- a multi-GB model is too expensive to reload per layer. Public
     top-scoring solutions for this competition use MIDDLE layers (e.g. Qwen3-8B L7+L22, not the
     last layer) rather than assuming the final layer is best -- this sweeps several to check.
     Returns {layer_idx: np.array[n, hidden]}."""
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:  # most decoder-only models have no pad token by default
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # keeps the last REAL token at index -1 for every row
+    if architecture == "causal":
+        tokenizer.padding_side = "left"  # irrelevant for mean pooling, kept for last_token pooling
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model_cls = AutoModelForCausalLM if architecture == "causal" else AutoModel
+    model = model_cls.from_pretrained(
         model_name, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
     ).to(DEVICE).eval()
     out = {layer: [] for layer in layers}
@@ -65,8 +71,10 @@ def extract_decoder_embeddings(model_name, texts, max_length=256, batch_size=16,
                 hidden = all_hidden[layer]
                 if pooling == "mean":
                     pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
+                elif pooling == "cls":
+                    pooled = hidden[:, 0, :]  # first token -- BERT-style [CLS]/<s>
                 else:
-                    pooled = hidden[:, -1, :]
+                    pooled = hidden[:, -1, :]  # last_token
                 out[layer].append(pooled.float().cpu().numpy())
             if (i // batch_size) % 20 == 0:
                 log(f"  embedded {min(i + batch_size, len(texts))}/{len(texts)}")
@@ -94,14 +102,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_name", default="Qwen/Qwen2.5-0.5B",
                      help="any causal/decoder HF model, e.g. Qwen/Qwen2.5-0.5B, "
-                          "HuggingFaceTB/SmolLM2-360M, meta-llama/Llama-3.2-1B")
+                          "HuggingFaceTB/SmolLM2-360M, meta-llama/Llama-3.2-1B -- or, with "
+                          "--architecture encoder, microsoft/deberta-v3-base, roberta-base, etc.")
+    ap.add_argument("--architecture", default="causal", choices=["causal", "encoder"],
+                     help="causal (AutoModelForCausalLM, e.g. Qwen) or encoder (AutoModel, e.g. "
+                          "DeBERTa/RoBERTa/ELECTRA) -- controls model class and whether "
+                          "last_token pooling would even make sense (encoders: always mean).")
     ap.add_argument("--max_length", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--classifier", default="lr", choices=["lr", "svm"])
-    ap.add_argument("--pooling", default="mean", choices=["last_token", "mean"],
-                     help="mean (default -- found better than last_token in an earlier small-"
-                          "model test) or last_token (theoretically correct for causal attention, "
-                          "but empirically worse here)")
+    ap.add_argument("--pooling", default="mean", choices=["last_token", "mean", "cls"],
+                     help="mean (default), last_token (causal models, empirically worse than "
+                          "mean), or cls (first-token pooling, e.g. BERT-style [CLS]/<s> -- the "
+                          "token BERT-family pretraining actually optimizes for sentence-level "
+                          "representation, untested here before now)")
     ap.add_argument("--layers", default="-1",
                      help="comma-separated hidden_states indices to sweep in one model load, "
                           "e.g. '-1,19,13,7' (negative = from the end; 0 = embedding output). "
@@ -127,17 +141,20 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     def cache_path_for(layer):
-        key = hashlib.md5(f"{args.model_name}_{args.max_length}_{args.pooling}_{layer}".encode()).hexdigest()[:10]
+        key = hashlib.md5(
+            f"{args.model_name}_{args.architecture}_{args.max_length}_{args.pooling}_{layer}".encode()
+        ).hexdigest()[:10]
         return cache_dir / f"{key}.npy"
 
     missing = [l for l in layers if not cache_path_for(l).exists()]
     emb_by_layer = {l: np.load(cache_path_for(l)) for l in layers if l not in missing}
     if missing:
-        print(f"extracting {args.pooling}-pooled embeddings from {args.model_name} for layers "
-              f"{missing} (device={DEVICE})...")
+        print(f"extracting {args.pooling}-pooled embeddings from {args.model_name} "
+              f"({args.architecture}) for layers {missing} (device={DEVICE})...")
         fresh = extract_decoder_embeddings(
             args.model_name, df["text"].tolist(), max_length=args.max_length,
-            pooling=args.pooling, layers=missing, batch_size=args.batch_size, log=print,
+            pooling=args.pooling, layers=missing, architecture=args.architecture,
+            batch_size=args.batch_size, log=print,
         )
         for l, arr in fresh.items():
             np.save(cache_path_for(l), arr)
@@ -148,7 +165,7 @@ def main():
     for layer in layers:
         emb = emb_by_layer[layer]
         run = ExperimentRun(
-            f"decoder_embed_{args.model_name.split('/')[-1]}_L{layer}_{args.pooling}_{args.classifier}",
+            f"{args.architecture}_embed_{args.model_name.split('/')[-1]}_L{layer}_{args.pooling}_{args.classifier}",
             config={**config, "layer": layer, "embedding_shape": list(emb.shape)},
         )
         oof_proba = np.full((len(df), len(class_labels)), np.nan, dtype=np.float32)
