@@ -106,6 +106,18 @@ def main():
     ap.add_argument("--max_length", type=int, default=384)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--out", default="submission.parquet")
+    ap.add_argument("--cluster_assign", action="store_true",
+                     help="post-process predictions with prompt_cluster_assign.py: detect "
+                          "passages likely sharing a hidden prompt via TF-IDF similarity, then "
+                          "resolve within-cluster label conflicts by confidence rank instead of "
+                          "plain per-row argmax. Calibrated on train (see TRIED.md): a real but "
+                          "small, fragile gain on the fusion_lgbm model (~+0.004-0.005 at the "
+                          "best threshold, sign-unstable nearby) -- low risk, modest upside, off "
+                          "by default.")
+    ap.add_argument("--cluster_threshold", type=float, default=DEFAULT_THRESHOLD,
+                     help="TF-IDF cosine similarity threshold for prompt_cluster_assign.py's "
+                          "cluster detection -- see its module docstring / TRIED.md for the "
+                          "calibration sweep behind this default.")
     args = ap.parse_args()
 
     artifacts_dir = find_run_dir(args.run_dir)
@@ -137,7 +149,16 @@ def main():
 
     assert n_used > 0, f"no fold checkpoints found under {artifacts_dir}"
     avg_proba /= n_used
-    pred_idx = avg_proba.argmax(axis=1)
+
+    if args.cluster_assign:
+        print(f"detecting prompt clusters (threshold={args.cluster_threshold}) and resolving "
+              f"within-cluster conflicts by rank...")
+        cluster_labels = detect_clusters(texts, threshold=args.cluster_threshold)
+        n_multi = sum(1 for c in np.unique(cluster_labels) if (cluster_labels == c).sum() > 1)
+        print(f"  {n_multi} multi-row clusters detected out of {len(texts)} rows")
+        pred_idx = resolve_cluster_assignments(avg_proba, cluster_labels, max_cluster_size=k)
+    else:
+        pred_idx = avg_proba.argmax(axis=1)
     pred_labels = [labels_sorted[i] for i in pred_idx]
 
     sub = pd.DataFrame({"id": test["id"], "model": pred_labels})
