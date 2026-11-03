@@ -24,6 +24,7 @@ from scipy.sparse import hstack
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from paths import data_dir
+from prompt_cluster_assign import DEFAULT_THRESHOLD, detect_clusters, resolve_cluster_assignments
 from stylometric import stylometric_matrix
 from train_fusion_lgbm import infer
 

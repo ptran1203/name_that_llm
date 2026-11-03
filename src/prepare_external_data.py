@@ -36,6 +36,11 @@ RAW_CANDIDATES = {
         pathlib.Path("/kaggle/input/datasets/darragh1walsh/ntl-kaggle-ai-gen-run-1"),
         pathlib.Path("/kaggle/input/ntl-kaggle-ai-gen-run-1"),
     ],
+    "enaimaan": [
+        _REPO_ROOT / "data/external/raw/enaimaan",
+        pathlib.Path("/kaggle/input/datasets/enaimaan/ntl-openai-generated-responses"),
+        pathlib.Path("/kaggle/input/ntl-openai-generated-responses"),
+    ],
 }
 
 
@@ -104,11 +109,41 @@ def prep_darragh():
     })
 
 
+def prep_enaimaan():
+    """model is the API's own serving-model label (real generation metadata), not a third-party
+    claim -- more trustworthy provenance than ntl_open_pool's. Caveat that travels with the data
+    via the kept request_status column instead of getting silently merged away: NONE of these
+    prompts are verified byte-identical to the competition's own prompts. 'gap' rows
+    (request_status=rendered_from_documented_template_not_byte_verified) render a reconstructed
+    community template; 'new' rows (request_status=autoresearch_candidate_v1) use a non-
+    competition system instruction on expanded/invented prompt panels. Only 4 models covered
+    (gpt-5.6-luna/sol/terra, gpt-6-astra) -- directly relevant since gpt-5.6-luna/sol/terra is
+    one of our known hard sibling-confusion triplets. cv_group (after applying the dataset's own
+    lineage-aliases.json, per its README) is the closest analog to prompt_id -- the dataset's own
+    recommended CV-grouping key."""
+    import json
+
+    raw = resolve_raw_dir("enaimaan")
+    df = pd.read_csv(raw / "train.csv")
+    aliases = json.loads((raw / "lineage-aliases.json").read_text())
+    cv_group = df["cv_group"].map(lambda g: aliases.get(g, g))
+    return pd.DataFrame({
+        "id": "enaimaan_" + df["id"].astype(str),
+        "prompt_id": "enaimaan_" + cv_group.astype(str),
+        "text": df["text"].astype(str),
+        "model": df["model"],
+        "source_dataset": "enaimaan",
+        "request_status": df["request_status"],
+    })
+
+
 def main():
     official = pd.read_csv(data_dir() / "train.csv")
     out = out_dir()
 
-    for name, prep_fn in [("prvsiyan", prep_prvsiyan), ("darragh1walsh", prep_darragh)]:
+    for name, prep_fn in [
+        ("prvsiyan", prep_prvsiyan), ("darragh1walsh", prep_darragh), ("enaimaan", prep_enaimaan),
+    ]:
         df = prep_fn()
         before = len(df)
         sim = check_leakage(df["text"].tolist(), official["text"].tolist())
