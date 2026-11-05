@@ -79,9 +79,23 @@ class LayerPoolClassifier(nn.Module):
 
 
 def build_model(model_name, num_labels, layer, lora_r, lora_alpha, lora_dropout,
-                 gradient_checkpointing, precision, log):
+                 gradient_checkpointing, precision, load_in_4bit, log):
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-    base = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(DEVICE)
+
+    if load_in_4bit:
+        # QLoRA: the frozen base stays in 4-bit (~1/4 the memory of bf16), LoRA adapters still
+        # train in `dtype`. Needed once the base model itself is too big to fit alongside LoRA's
+        # activation memory otherwise (e.g. 7B+ on a single 16GB GPU) -- not needed at 3B.
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+        )
+        base = AutoModel.from_pretrained(model_name, quantization_config=bnb_config, device_map={"": 0})
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=gradient_checkpointing)
+    else:
+        base = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(DEVICE)
     hidden_size = base.config.hidden_size
 
     lora_config = LoraConfig(
@@ -90,7 +104,7 @@ def build_model(model_name, num_labels, layer, lora_r, lora_alpha, lora_dropout,
         task_type="FEATURE_EXTRACTION",
     )
     base = get_peft_model(base, lora_config)
-    if gradient_checkpointing:
+    if gradient_checkpointing and not load_in_4bit:  # prepare_model_for_kbit_training already enabled it
         base.gradient_checkpointing_enable()
     trainable = sum(p.numel() for p in base.parameters() if p.requires_grad)
     total = sum(p.numel() for p in base.parameters())
@@ -133,6 +147,11 @@ def main():
                           "documented fp16 GradScaler crash history. Use fp32 on a GPU without "
                           "bf16 support (e.g. T4/P100).")
     ap.add_argument("--no_gradient_checkpointing", action="store_true")
+    ap.add_argument("--load_in_4bit", action="store_true",
+                     help="QLoRA: quantize the frozen base to 4-bit (bitsandbytes) before "
+                          "attaching LoRA adapters -- needed once the base model itself doesn't "
+                          "fit alongside LoRA's activation memory (e.g. 7B+ on a 16GB GPU). Not "
+                          "needed at 3B. Requires `pip install bitsandbytes`.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -164,7 +183,8 @@ def main():
 
         model = build_model(args.model_name, len(class_labels), args.pooling_layer,
                              args.lora_r, args.lora_alpha, args.lora_dropout,
-                             not args.no_gradient_checkpointing, args.precision, run.log)
+                             not args.no_gradient_checkpointing, args.precision,
+                             args.load_in_4bit, run.log)
 
         training_args = build_training_args(dict(
             output_dir=str(run.artifact_path(f"fold{fold}_ckpt")),
