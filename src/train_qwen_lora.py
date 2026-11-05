@@ -101,7 +101,14 @@ def build_model(model_name, num_labels, layer, lora_r, lora_alpha, lora_dropout,
         # LOCAL_RANK) -- a hardcoded device would put every DDP process's model on the same GPU.
         base = AutoModel.from_pretrained(model_name, quantization_config=bnb_config,
                                           device_map={"": str(DEVICE)})
-        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=gradient_checkpointing)
+        # use_reentrant=False: the default reentrant checkpoint re-runs part of the forward
+        # pass during backward, which conflicts with DDP's parameter-ready tracking under
+        # multi-GPU training ("marked as ready twice") -- non-reentrant is the mode PyTorch
+        # itself now recommends, and avoids this class of bug entirely.
+        base = prepare_model_for_kbit_training(
+            base, use_gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
     else:
         base = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(DEVICE)
     hidden_size = base.config.hidden_size
@@ -113,7 +120,7 @@ def build_model(model_name, num_labels, layer, lora_r, lora_alpha, lora_dropout,
     )
     base = get_peft_model(base, lora_config)
     if gradient_checkpointing and not load_in_4bit:  # prepare_model_for_kbit_training already enabled it
-        base.gradient_checkpointing_enable()
+        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     trainable = sum(p.numel() for p in base.parameters() if p.requires_grad)
     total = sum(p.numel() for p in base.parameters())
     log(f"LoRA base: {trainable:,}/{total:,} trainable ({100 * trainable / total:.3f}%)")
