@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from accelerate import PartialState
 from peft import LoraConfig, get_peft_model
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold
@@ -36,7 +37,11 @@ from exp_log import ExperimentRun
 from paths import data_dir
 from train_transformer import build_training_args
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Under accelerate/DDP each process has its own assigned GPU -- PartialState().device resolves
+# to the right one for THIS process regardless of launch method (accelerate launch, torchrun,
+# plain python), unlike hand-parsing LOCAL_RANK ourselves. A bare "cuda" always means cuda:0,
+# which would put every process's model on the same GPU and break DDP.
+DEVICE = PartialState().device
 
 
 class TextDataset(Dataset):
@@ -92,7 +97,10 @@ def build_model(model_name, num_labels, layer, lora_r, lora_alpha, lora_dropout,
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
         )
-        base = AutoModel.from_pretrained(model_name, quantization_config=bnb_config, device_map={"": 0})
+        # device_map must point at THIS process's own assigned GPU (DEVICE, derived from
+        # LOCAL_RANK) -- a hardcoded device would put every DDP process's model on the same GPU.
+        base = AutoModel.from_pretrained(model_name, quantization_config=bnb_config,
+                                          device_map={"": str(DEVICE)})
         base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=gradient_checkpointing)
     else:
         base = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(DEVICE)
