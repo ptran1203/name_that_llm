@@ -11,6 +11,13 @@ HARDCODED file list from `src/` into `kaggle_code_package/`, commits the repo lo
 `kaggle datasets version` to push a new dataset version. It does NOT push to the GitHub remote —
 that's a separate step if wanted.
 
+**Only relevant for INFERENCE/submission scripts** (`predict.py`,
+`predict_qwen_ensemble_artifacts.py`, `submit_*.py`) — those run with internet disabled at
+submission time, so they need code delivered via this packaged dataset. TRAINING/artifact-
+producing scripts (`train_qwen_ensemble_artifacts.py`, `train_fusion_lgbm.py`,
+`train_qwen_lora.py`, etc.) run in notebooks that DO have internet access and should just
+`git clone origin/main` directly instead — don't bother syncing those here.
+
 ## Steps
 
 1. `git status` / `git diff` to see what actually changed.

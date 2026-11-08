@@ -17,6 +17,15 @@ Kaggle datasets/models this project's inference notebooks attach, by Kaggle user
 unless noted. Local repo has no access to any of these paths — they only resolve inside a Kaggle
 notebook session.
 
+- **Training notebooks have internet access — don't use the packaged code dataset for them,
+  `git clone` the repo directly instead.** Only INFERENCE/submission notebooks need code
+  delivered via a Kaggle input dataset (competition submissions typically run with internet
+  disabled). So: `train_qwen_ensemble_artifacts.py`, `train_fusion_lgbm.py`, `train_qwen_lora.py`
+  and any other artifact-producing/training script → clone `origin/main` fresh each run, always
+  latest code, no manual sync step needed at all. `predict.py`, `predict_qwen_ensemble_artifacts.py`,
+  `submit_frozen_qwen_tfidf_cluster.py`, `submit_multi_qwen_ensemble.py` and anything else run as
+  the FINAL submission → needs the packaged dataset below, kept in sync via `update_code.bat`/
+  the `sync-kaggle` skill, since internet won't be available to clone from at submission time.
 - **Inference code dataset**: `/kaggle/input/datasets/ptran1203/name-that-llm-inference-code/`
   — a packaged copy of (a subset of) `src/`, re-uploaded manually after local changes. Currently
   holds `predict.py` + its direct dependencies (`prompt_cluster_assign.py`, `stylometric.py`,
