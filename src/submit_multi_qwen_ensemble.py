@@ -123,6 +123,16 @@ def main():
                           "each becomes its own OOF source for the ensemble below.")
     ap.add_argument("--cluster_threshold", type=float, default=0.24)
     ap.add_argument("--out", default="submission.parquet")
+    ap.add_argument("--extract_only", action="store_true",
+                     help="extract+cache train and test embeddings for --model_names, then "
+                          "exit -- no classifier fitting, no blend, no submission. Lets you "
+                          "use 2 GPUs safely: run this twice in parallel, each with a DIFFERENT "
+                          "--model_names subset and its own CUDA_VISIBLE_DEVICES, each writing "
+                          "to the SAME --cache_dir. Then one final normal (no --extract_only) "
+                          "run with the FULL --model_names list hits the cache for all of them "
+                          "-- no GPU-heavy work repeated, and no Trainer/DataParallel/DDP "
+                          "involved anywhere (this script is plain forward-pass extraction, "
+                          "none of TRIED.md's multi-GPU Trainer bugs apply here).")
     args = ap.parse_args()
 
     model_names = args.model_names.split(",")
@@ -141,6 +151,16 @@ def main():
     train_df = pd.read_csv(data_dir() / "train.csv")
     test_df = pd.read_csv(data_dir() / "test.csv")
     class_labels = sorted(train_df["model"].unique())
+
+    if args.extract_only:
+        run.log("--extract_only: caching train+test embeddings for this model subset, then exiting")
+        get_concat_embedding(train_df["text"].tolist(), "official", model_names, layers,
+                              args.max_length, args.batch_size, args.cache_dir, run.log, needs_4bit)
+        get_concat_embedding(test_df["text"].tolist(), "submission_test", model_names, layers,
+                              args.max_length, args.batch_size, args.cache_dir, run.log, needs_4bit)
+        run.log("done -- rerun without --extract_only, with the FULL --model_names list, to "
+                "actually fit classifiers and write a submission.")
+        return
 
     # -- step 1: concatenated embedding (train + test), extracted/cached once per model --
     run.log("extracting/loading per-model embeddings (train)...")
