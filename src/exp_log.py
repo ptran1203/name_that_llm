@@ -16,7 +16,14 @@ import sys
 import time
 from pathlib import Path
 
-EXPERIMENTS_ROOT = Path(__file__).resolve().parent.parent / "experiments"
+# /kaggle/working is the only writable dir in a Kaggle notebook -- this script's own file often
+# lives under a READ-ONLY /kaggle/input/datasets/.../ dataset there (unlike a local git checkout,
+# where parent.parent is the writable repo root), so mkdir-ing relative to __file__ crashes on
+# Kaggle. Same fix paths.py's models_dir() already uses.
+EXPERIMENTS_ROOT = (
+    Path("/kaggle/working/experiments") if Path("/kaggle/working").exists()
+    else Path(__file__).resolve().parent.parent / "experiments"
+)
 
 
 def _git_commit():
