@@ -49,6 +49,22 @@ from train import build_vectorizers, fit_transform
 LAYER_FRACTION_DEFAULT = 0.19  # TRIED.md: Qwen2.5-3B's empirically-best layer was ~19% depth
 
 
+def validate_model_names(model_names):
+    """A local path that doesn't actually exist (e.g. the Kaggle Model wasn't attached as an
+    input to THIS notebook) falls through transformers' from_pretrained into treating the
+    string as a HuggingFace Hub repo id instead -- which then fails with a confusing
+    'Repo id must be in the form...' error that has nothing to do with the real problem. Catch
+    it here with a clear message instead."""
+    for name in model_names:
+        if name.startswith("/") and not Path(name).is_dir():
+            raise FileNotFoundError(
+                f"Local model path does not exist: {name!r} -- if this is a Kaggle Model, check "
+                f"it's attached as an input to THIS notebook (Add Input > Models), and that the "
+                f"path matches exactly what's mounted (try `!ls {Path(name).parent}` to see "
+                f"what's actually there)."
+            )
+
+
 def default_layer_for(model_name, fraction=LAYER_FRACTION_DEFAULT):
     """UNTESTED-per-model guess -- see module docstring. Sweep with
     experiment_decoder_embedding.py and pass --layers explicitly once you know better."""
@@ -136,6 +152,7 @@ def main():
     args = ap.parse_args()
 
     model_names = args.model_names.split(",")
+    validate_model_names(model_names)
     bit4_substrings = [s for s in args.load_in_4bit_for.split(",") if s]
     needs_4bit = [any(s in m for s in bit4_substrings) for m in model_names]
     if args.layers:

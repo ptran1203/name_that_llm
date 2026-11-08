@@ -40,6 +40,7 @@ from paths import data_dir
 from prompt_cluster_assign import detect_clusters, resolve_cluster_assignments_hungarian
 from submit_multi_qwen_ensemble import (
     default_layer_for, get_concat_embedding, get_oof, make_embedding_clf, make_tfidf_clf,
+    validate_model_names,
 )
 from train import build_vectorizers, fit_transform
 
@@ -62,6 +63,7 @@ def main():
     args = ap.parse_args()
 
     model_names = args.model_names.split(",")
+    validate_model_names(model_names)
     bit4_substrings = [s for s in args.load_in_4bit_for.split(",") if s]
     needs_4bit = [any(s in m for s in bit4_substrings) for m in model_names]
     if args.layers:
