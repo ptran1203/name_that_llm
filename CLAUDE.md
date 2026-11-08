@@ -31,15 +31,35 @@ notebook session.
 - **Code sync script**: `scripts\update_code.bat ["commit message"]` — copies a HARDCODED file
   list from `src/` into `kaggle_code_package/`, commits the repo, then runs
   `kaggle datasets version -p kaggle_code_package` to push a new version of the
-  `name-that-llm-inference-code` dataset above. The hardcoded list (inside the .bat) is
-  currently: `paths.py stylometric.py train.py train_transformer.py train_fusion_lgbm.py
-  exp_log.py predict.py prepare_external_data.py prompt_cluster_assign.py`.
-  **This list does NOT include any of this session's new scripts** (`ensemble_utils.py`,
-  `experiment_decoder_embedding.py`, `experiment_multi_embed_concat.py`, `recon_checks.py`,
-  `experiment_hard_cluster_specialists.py`, `submit_frozen_qwen_tfidf_cluster.py`,
-  `submit_multi_qwen_ensemble.py`, `contrastive_losses.py`, `train_qwen_lora.py`) — running the
-  script as-is will NOT sync the new pipelines. Add the needed ones to that `for %%F in (...)`
-  line before running it for anything beyond the existing fusion_lgbm/predict.py path.
+  `name-that-llm-inference-code` dataset above. Use the `sync-kaggle` skill (`.claude/skills/`)
+  for this rather than redoing the steps manually — it already knows the dependency closures per
+  entry script. The file list goes stale whenever a new script is added; check it's current
+  before assuming a script is live on Kaggle.
+- **2-notebook training/inference split**: `train_qwen_ensemble_artifacts.py` (does all the
+  TRAIN-side work -- embedding extraction, OOF, calibration, blend-weight fitting, final
+  classifier fitting -- then saves a bundle to `--artifacts_dir`: `config.json`,
+  `class_labels.json`, `embedding_clf_<name>.joblib` per classifier, `tfidf_word_vec.joblib`/
+  `tfidf_char_vec.joblib`/`tfidf_clf.joblib`, `temperatures.json`, `blend_weights.json`) +
+  `predict_qwen_ensemble_artifacts.py` (loads that bundle, extracts embeddings for TEST ONLY,
+  predicts, applies the saved calibration/blend/Hungarian, writes submission -- fast, never
+  touches train.csv). Run the first as a "training notebook" that outputs a new Kaggle dataset
+  (the artifacts dir), attach that dataset to a separate "inference notebook" that runs the
+  second. Pseudo-labeling was discussed as a possible future addition to the inference script
+  (concatenate high-confidence test predictions into train, rerun training) -- NOT implemented.
+- **2-GPU extraction**: `submit_multi_qwen_ensemble.py --extract_only` caches embeddings for a
+  model subset then exits (no classifier fitting) -- run it twice with different `--model_names`
+  subsets and `CUDA_VISIBLE_DEVICES`, then one final full run hits the cache for everything.
+  No `Trainer`/DataParallel/DDP anywhere in this script (plain forward-pass extraction), so none
+  of TRIED.md's multi-GPU `Trainer` bugs apply -- safe to use 2 GPUs here unlike training.
+  **Must use real `subprocess.Popen` in a Python cell to actually run the two in parallel** --
+  Jupyter/Kaggle notebooks reject `!cmd &` background-job syntax outright
+  (`OSError: Background processes not supported.`), it's an IPython restriction, not a Kaggle
+  bug. `train_qwen_ensemble_artifacts.py` doesn't have `--extract_only` yet (only
+  `submit_multi_qwen_ensemble.py` does) -- add it there too if this 2-notebook split also needs
+  2-GPU extraction.
+- **`bitsandbytes` is NOT preinstalled on Kaggle's base image** (or too old for 4-bit) -- run
+  `!pip install -U "bitsandbytes>=0.46.1"` as its own cell before anything using
+  `--load_in_4bit_for`.
 - **Current submission command** (fusion_lgbm + cluster-assign pipeline):
   ```
   !python /kaggle/input/datasets/ptran1203/name-that-llm-inference-code/predict.py \
@@ -51,8 +71,12 @@ notebook session.
 - **Qwen3 models** (Kaggle Models input, not a Datasets path):
   - `/kaggle/input/models/qwen-lm/qwen-3/transformers/8b-base/1` — base decoder LM, fits a
     12GB-class GPU in fp16/bf16.
-  - `/kaggle/input/models/qwen-lm/qwen-3/transformers/14b/1` — base decoder LM, bigger; use
-    `--load_in_4bit_for 14b` with `submit_multi_qwen_ensemble.py`.
+  - `/kaggle/input/models/qwen-lm/qwen-3/transformers/14b/1` — base decoder LM, bigger; needs
+    4-bit.
+  - Hit a CUDA OOM using `--load_in_4bit_for 14b` alone -- the 8B models' fp16 weights alone
+    (~16GB) are ALSO too big for a single 16GB Kaggle GPU before any activation memory. Use
+    `--load_in_4bit_for 8b,14b` (substring match catches `8b-base` and `qwen-3-embedding/8b`
+    too) to quantize every model >=8B, leaving only the 4B embedding model in fp16.
   - `/kaggle/input/models/qwen-lm/qwen-3-embedding/transformers/{4b,8b}/1` — retrieval/semantic-
     similarity embedding models, NOT base decoders. Flagged as likely bad for this task: the
     same category as bge/e5/mpnet, already tested frozen and found catastrophic (0.13-0.17,

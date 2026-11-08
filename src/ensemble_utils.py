@@ -116,16 +116,22 @@ def fit_temperature(oof_proba, y_true, class_labels, log=print):
     T = res.x
     log(f"  fitted temperature T={T:.3f} (log_loss before={nll(1.0):.4f}, after={nll(T):.4f})")
 
-    scaled = logits / T
-    scaled -= scaled.max(axis=1, keepdims=True)
-    calibrated = np.exp(scaled)
-    calibrated /= calibrated.sum(axis=1, keepdims=True)
-
+    calibrated = apply_temperature(oof_proba, T)
     pred_before = oof_proba.argmax(axis=1)
     pred_after = calibrated.argmax(axis=1)
     log(f"  balanced_accuracy unchanged by design: before={balanced_accuracy_score(y_idx, pred_before):.4f} "
         f"after={balanced_accuracy_score(y_idx, pred_after):.4f}")
     return T, calibrated
+
+
+def apply_temperature(proba, T):
+    """Applies an ALREADY-FITTED temperature T (from fit_temperature) to new probabilities --
+    e.g. test-time predictions, which must use the SAME T fit on train OOF, not a freshly-fit
+    one (fitting on test would need labels we don't have)."""
+    logits = np.log(np.clip(proba, 1e-12, None)) / T
+    logits -= logits.max(axis=1, keepdims=True)
+    p = np.exp(logits)
+    return p / p.sum(axis=1, keepdims=True)
 
 
 if __name__ == "__main__":
