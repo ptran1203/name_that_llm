@@ -28,6 +28,7 @@ prompt_id groups) this is modeled on. Ship it as a low-risk, modest-upside optio
 guaranteed win.
 """
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from sklearn.preprocessing import normalize
@@ -96,6 +97,36 @@ def resolve_cluster_assignments(proba, cluster_labels, max_cluster_size=18):
             if len(used_rows) == n:
                 break
         for r, k in assign.items():
+            pred[members[r]] = k
+
+    return pred
+
+
+def resolve_cluster_assignments_hungarian(proba, cluster_labels, max_cluster_size=18):
+    """Optimal (not greedy) within-cluster assignment via the Hungarian algorithm (scipy's
+    linear_sum_assignment) -- jointly maximizes the SUM of assigned log-probabilities across the
+    whole cluster, unlike resolve_cluster_assignments() above, which commits to each highest-
+    confidence (row, class) pair one at a time and can leave a worse overall assignment on the
+    table. TRIED.md's oracle test (using TRUE prompt_id groups, not detected ones) found this
+    scores higher than greedy (0.4453 vs 0.3905 on the TF-IDF+LR baseline) -- that was a one-off
+    check, never wired into the actual pipeline; this is that same algorithm made reusable here,
+    alongside the greedy one (ideas list item 30)."""
+    pred = np.argmax(np.nan_to_num(proba, nan=-1.0), axis=-1).copy()
+    valid = ~np.isnan(proba).any(axis=1)
+
+    by_cluster = {}
+    for i, c in enumerate(cluster_labels):
+        if valid[i]:
+            by_cluster.setdefault(c, []).append(i)
+
+    for members in by_cluster.values():
+        n = len(members)
+        if n < 2 or n > max_cluster_size:
+            continue
+        sub = proba[members]  # [n, n_classes]
+        cost = -np.log(np.clip(sub, 1e-12, None))
+        row_idx, col_idx = linear_sum_assignment(cost)
+        for r, k in zip(row_idx, col_idx):
             pred[members[r]] = k
 
     return pred

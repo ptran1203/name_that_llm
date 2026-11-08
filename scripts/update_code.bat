@@ -20,7 +20,7 @@ if not exist "kaggle_code_package\dataset-metadata.json" (
 )
 
 echo === Staging code files ===
-for %%F in (paths.py stylometric.py train.py train_transformer.py train_fusion_lgbm.py exp_log.py predict.py prepare_external_data.py prompt_cluster_assign.py) do (
+for %%F in (paths.py stylometric.py train.py train_transformer.py train_fusion_lgbm.py exp_log.py predict.py prepare_external_data.py prompt_cluster_assign.py ensemble_utils.py experiment_decoder_embedding.py experiment_multi_embed_concat.py submit_frozen_qwen_tfidf_cluster.py submit_multi_qwen_ensemble.py recon_checks.py experiment_hard_cluster_specialists.py contrastive_losses.py train_qwen_lora.py) do (
     copy /Y "src\%%F" "kaggle_code_package\%%F" >nul
     if errorlevel 1 (
         echo Failed to copy src\%%F

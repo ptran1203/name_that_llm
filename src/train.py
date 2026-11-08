@@ -233,7 +233,13 @@ def build_function_word_vectorizer():
     )
 
 
-def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False, use_function_words=False):
+def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False, use_function_words=False,
+                       features="combined", char_ngram_range=(3, 5)):
+    """features: "combined" (default, word+char -- every historical TRIED.md/IDEAS.md number
+    uses this), "word_only", or "char_only" -- standalone ablations (ideas list items 8/9) that
+    were never isolated before (the pipeline always combined both). char_ngram_range defaults to
+    the existing (3,5); item 8 asks for (2,5) specifically -- pass that explicitly to match it,
+    rather than silently changing the shared default every other result depends on."""
     if subword_tokenizer is not None:
         # Subword vocabulary comes from large external pretraining (BPE/SentencePiece), not fit
         # from scratch on our ~2699 rows -- a form of transfer that should reduce overfitting risk
@@ -256,24 +262,28 @@ def build_vectorizers(subword_tokenizer=None, use_punctuation_ngrams=False, use_
             strip_accents="unicode",
         )
     char_vec = TfidfVectorizer(
-        ngram_range=(3, 5),
+        ngram_range=char_ngram_range,
         min_df=2,
         sublinear_tf=True,
         analyzer="char_wb",
     )
+    if features == "char_only":
+        word_vec = None
+    elif features == "word_only":
+        char_vec = None
+    elif features != "combined":
+        raise ValueError(f"unknown features={features!r}")
     punct_vec = build_punctuation_vectorizer() if use_punctuation_ngrams else None
     func_vec = build_function_word_vectorizer() if use_function_words else None
     return word_vec, char_vec, punct_vec, func_vec
 
 
 def fit_transform(texts, word_vec, char_vec, punct_vec=None, func_vec=None, fit=True):
-    if fit:
-        xw = word_vec.fit_transform(texts)
-        xc = char_vec.fit_transform(texts)
-    else:
-        xw = word_vec.transform(texts)
-        xc = char_vec.transform(texts)
-    parts = [xw, xc]
+    parts = []
+    if word_vec is not None:
+        parts.append(word_vec.fit_transform(texts) if fit else word_vec.transform(texts))
+    if char_vec is not None:
+        parts.append(char_vec.fit_transform(texts) if fit else char_vec.transform(texts))
     if punct_vec is not None:
         punct_texts = [extract_punctuation_stream(t) for t in texts]
         xp = punct_vec.fit_transform(punct_texts) if fit else punct_vec.transform(punct_texts)
@@ -291,7 +301,8 @@ def default_clf_factory():
 
 
 def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
-                    use_function_words=False, clf_factory=default_clf_factory):
+                    use_function_words=False, clf_factory=default_clf_factory,
+                    features="combined", char_ngram_range=(3, 5)):
     """Returns (scores, oof_proba, class_labels) -- oof_proba is [n_rows, n_classes], aligned to
     df's row order (np.nan where a row was never in a val fold, shouldn't happen with the full
     GroupKFold split). Saved by main() so different tokenizer_spec/clf_factory runs produce
@@ -324,7 +335,7 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
                      if refit_per_fold else shared_tokenizer)
 
         word_vec, char_vec, punct_vec, func_vec = build_vectorizers(
-            tokenizer, use_punctuation_ngrams, use_function_words)
+            tokenizer, use_punctuation_ngrams, use_function_words, features, char_ngram_range)
         X_train = fit_transform(train_df["text"], word_vec, char_vec, punct_vec, func_vec, fit=True)
         X_val = fit_transform(val_df["text"], word_vec, char_vec, punct_vec, func_vec, fit=False)
 
@@ -343,12 +354,13 @@ def cross_validate(df, n_splits=5, log=print, tokenizer_spec=None, use_punctuati
 
 
 def fit_final(df, artifact_path, log=print, tokenizer_spec=None, use_punctuation_ngrams=False,
-              use_function_words=False, clf_factory=default_clf_factory):
+              use_function_words=False, clf_factory=default_clf_factory,
+              features="combined", char_ngram_range=(3, 5)):
     tokenizer = build_tokenizer_from_spec(tokenizer_spec)
     if tokenizer is not None:
         tokenizer.fit(df["text"])
     word_vec, char_vec, punct_vec, func_vec = build_vectorizers(
-        tokenizer, use_punctuation_ngrams, use_function_words)
+        tokenizer, use_punctuation_ngrams, use_function_words, features, char_ngram_range)
     X = fit_transform(df["text"], word_vec, char_vec, punct_vec, func_vec, fit=True)
     clf = clf_factory()
     clf.fit(X, df["model"])
@@ -389,12 +401,23 @@ def main():
                           "nbsvm = NBSVM (IDEAS.md #7): scales TF-IDF features by each class's "
                           "Naive-Bayes log-count ratio before a one-vs-rest linear classifier, "
                           "instead of raw/plain TF-IDF weights. Untested here.")
+    ap.add_argument("--features", default="combined", choices=["combined", "word_only", "char_only"],
+                     help="combined (default) = word_vec+char_vec, every historical result uses "
+                          "this. word_only/char_only isolate just one block -- standalone "
+                          "baseline ablations (ideas list items 8/9), never run before since the "
+                          "pipeline always combined both.")
+    ap.add_argument("--char_ngram_min", type=int, default=3,
+                     help="char_vec's n-gram range is (this, 5) -- default 3 matches every "
+                          "historical result; ideas list item 8 asks for (2,5) specifically, "
+                          "pass --char_ngram_min 2 --features char_only to match it exactly.")
     args = ap.parse_args()
     clf_factory = (lambda: NBSVM(C=1.0, max_iter=2000)) if args.classifier == "nbsvm" else default_clf_factory
+    char_ngram_range = (args.char_ngram_min, 5)
 
-    config = {"ngram_word": [1, 2], "ngram_char": [3, 5], "C": 5.0, "n_splits": 5,
+    config = {"ngram_word": [1, 2], "ngram_char": list(char_ngram_range), "C": 5.0, "n_splits": 5,
               "tokenizer_spec": args.tokenizer_spec, "punctuation_ngrams": args.punctuation_ngrams,
-              "function_words": args.function_words, "classifier": args.classifier}
+              "function_words": args.function_words, "classifier": args.classifier,
+              "features": args.features}
     run_name = "tfidf_lr_baseline" if not args.tokenizer_spec else (
         "tfidf_lr_" + args.tokenizer_spec.split(":")[0].replace("/", "-"))
     if args.punctuation_ngrams:
@@ -403,13 +426,15 @@ def main():
         run_name += "_func"
     if args.classifier != "lr":
         run_name += "_" + args.classifier
+    if args.features != "combined":
+        run_name += "_" + args.features
     run = ExperimentRun(run_name, config=config)
 
     df = pd.read_csv(data_dir() / "train.csv")
     scores, oof_proba, class_labels = cross_validate(
         df, n_splits=config["n_splits"], log=run.log, tokenizer_spec=args.tokenizer_spec,
         use_punctuation_ngrams=args.punctuation_ngrams, use_function_words=args.function_words,
-        clf_factory=clf_factory,
+        clf_factory=clf_factory, features=args.features, char_ngram_range=char_ngram_range,
     )
     run.log_scores("balanced_accuracy", scores)
     np.save(run.artifact_path("oof_proba.npy"), oof_proba)
@@ -420,7 +445,8 @@ def main():
 
     fit_final(df, run.artifact_path("baseline.joblib"), log=run.log,
               tokenizer_spec=args.tokenizer_spec, use_punctuation_ngrams=args.punctuation_ngrams,
-              use_function_words=args.function_words, clf_factory=clf_factory)
+              use_function_words=args.function_words, clf_factory=clf_factory,
+              features=args.features, char_ngram_range=char_ngram_range)
 
 
 if __name__ == "__main__":

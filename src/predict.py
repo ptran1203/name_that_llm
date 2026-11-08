@@ -24,7 +24,10 @@ from scipy.sparse import hstack
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from paths import data_dir
-from prompt_cluster_assign import DEFAULT_THRESHOLD, detect_clusters, resolve_cluster_assignments
+from prompt_cluster_assign import (
+    DEFAULT_THRESHOLD, detect_clusters, resolve_cluster_assignments,
+    resolve_cluster_assignments_hungarian,
+)
 from stylometric import stylometric_matrix
 from train_fusion_lgbm import infer
 
@@ -118,6 +121,14 @@ def main():
                      help="TF-IDF cosine similarity threshold for prompt_cluster_assign.py's "
                           "cluster detection -- see its module docstring / TRIED.md for the "
                           "calibration sweep behind this default.")
+    ap.add_argument("--cluster_resolve", default="greedy", choices=["greedy", "hungarian"],
+                     help="greedy (default, calibrated in TRIED.md) resolves conflicts by "
+                          "confidence rank, one (row, class) pair at a time. hungarian (ideas "
+                          "list item 30) solves the whole cluster's assignment JOINTLY/optimally "
+                          "-- TRIED.md's oracle test (true prompt_id groups) found this scores "
+                          "higher than greedy (0.4453 vs 0.3905), but that was only tested with "
+                          "ground-truth groups, never with DETECTED clusters end to end -- try "
+                          "both and compare before trusting either on the real submission.")
     args = ap.parse_args()
 
     artifacts_dir = find_run_dir(args.run_dir)
@@ -155,8 +166,11 @@ def main():
               f"within-cluster conflicts by rank...")
         cluster_labels = detect_clusters(texts, threshold=args.cluster_threshold)
         n_multi = sum(1 for c in np.unique(cluster_labels) if (cluster_labels == c).sum() > 1)
-        print(f"  {n_multi} multi-row clusters detected out of {len(texts)} rows")
-        pred_idx = resolve_cluster_assignments(avg_proba, cluster_labels, max_cluster_size=k)
+        print(f"  {n_multi} multi-row clusters detected out of {len(texts)} rows "
+              f"(resolve={args.cluster_resolve})")
+        resolver = (resolve_cluster_assignments_hungarian if args.cluster_resolve == "hungarian"
+                    else resolve_cluster_assignments)
+        pred_idx = resolver(avg_proba, cluster_labels, max_cluster_size=k)
     else:
         pred_idx = avg_proba.argmax(axis=1)
     pred_labels = [labels_sorted[i] for i in pred_idx]

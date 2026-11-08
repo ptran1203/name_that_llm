@@ -3,6 +3,7 @@ __pycache__/
 .ipynb_checkpoints/
 models/
 experiments/
+lora_external_only*/
 submission/*.parquet
 data/test.csv
 data/external/

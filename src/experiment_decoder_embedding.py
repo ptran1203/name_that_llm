@@ -38,7 +38,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def extract_decoder_embeddings(model_name, texts, max_length=256, batch_size=16, log=print,
-                                pooling="mean", layers=(-1,), architecture="causal"):
+                                pooling="mean", layers=(-1,), architecture="causal",
+                                load_in_4bit=False):
     """architecture='causal' (AutoModelForCausalLM, e.g. Qwen) or 'encoder' (AutoModel, e.g.
     DeBERTa/RoBERTa/ELECTRA) -- same layer-sweep + pooling logic either way, since mean-pooling
     with the attention mask is correct regardless of padding side or attention direction.
@@ -56,9 +57,22 @@ def extract_decoder_embeddings(model_name, texts, max_length=256, batch_size=16,
         tokenizer.padding_side = "left"  # irrelevant for mean pooling, kept for last_token pooling
 
     model_cls = AutoModelForCausalLM if architecture == "causal" else AutoModel
-    model = model_cls.from_pretrained(
-        model_name, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-    ).to(DEVICE).eval()
+    if load_in_4bit:
+        # Needed once a model's fp16 weights alone don't fit the GPU (e.g. Qwen2.5-7B, ~15GB,
+        # on a 12GB card) -- same BitsAndBytesConfig as train_qwen_lora.py's QLoRA path, just
+        # for frozen extraction (no adapters, no training) instead.
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
+        )
+        model = model_cls.from_pretrained(
+            model_name, quantization_config=bnb_config, device_map={"": DEVICE},
+        ).eval()
+    else:
+        model = model_cls.from_pretrained(
+            model_name, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+        ).to(DEVICE).eval()
     out = {layer: [] for layer in layers}
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
@@ -127,6 +141,10 @@ def main():
     ap.add_argument("--cache_dir", default="data/embed_cache",
                      help="cache extracted embeddings here, keyed by model_name+max_length+"
                           "pooling+layer, so re-running with a different --classifier skips extraction")
+    ap.add_argument("--load_in_4bit", action="store_true",
+                     help="load the model in 4-bit (bitsandbytes) for extraction -- needed once "
+                          "fp16 weights alone don't fit the GPU (e.g. Qwen2.5-7B on a 12GB card). "
+                          "Requires `pip install bitsandbytes`.")
     args = ap.parse_args()
     layers = tuple(int(x) for x in args.layers.split(","))
 
@@ -141,8 +159,11 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     def cache_path_for(layer):
+        # suffix only when non-default, so --load_in_4bit=False (the default, matching every
+        # previously cached run) keeps hitting the same cache keys as before this flag existed.
+        suffix = "_4bit" if args.load_in_4bit else ""
         key = hashlib.md5(
-            f"{args.model_name}_{args.architecture}_{args.max_length}_{args.pooling}_{layer}".encode()
+            f"{args.model_name}_{args.architecture}_{args.max_length}_{args.pooling}_{layer}{suffix}".encode()
         ).hexdigest()[:10]
         return cache_dir / f"{key}.npy"
 
@@ -154,7 +175,7 @@ def main():
         fresh = extract_decoder_embeddings(
             args.model_name, df["text"].tolist(), max_length=args.max_length,
             pooling=args.pooling, layers=missing, architecture=args.architecture,
-            batch_size=args.batch_size, log=print,
+            batch_size=args.batch_size, log=print, load_in_4bit=args.load_in_4bit,
         )
         for l, arr in fresh.items():
             np.save(cache_path_for(l), arr)

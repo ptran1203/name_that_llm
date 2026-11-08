@@ -52,29 +52,37 @@ DEFAULT_SOURCES = [
 ]
 
 
-def cache_path_for(cache_dir, tag, model_name, architecture, max_length, pooling, layer):
+def cache_path_for(cache_dir, tag, model_name, architecture, max_length, pooling, layer,
+                    load_in_4bit=False):
     """tag distinguishes official-train embeddings (tag='official', matching
     experiment_decoder_embedding.py's own cache key exactly, so official rows reuse that
     script's cache) from external-data embeddings (tag='external_<n_rows>', a different row
-    set -> must be its own cache entry, never collide with the official one)."""
+    set -> must be its own cache entry, never collide with the official one). load_in_4bit adds
+    a suffix (matching experiment_decoder_embedding.py's own convention) so a 4-bit extraction
+    never collides with -- and gets wrongly reused as -- a full-precision one of the same model."""
+    suffix = "_4bit" if load_in_4bit else ""
     if tag == "official":
-        key = hashlib.md5(f"{model_name}_{architecture}_{max_length}_{pooling}_{layer}".encode()).hexdigest()[:10]
+        key = hashlib.md5(f"{model_name}_{architecture}_{max_length}_{pooling}_{layer}{suffix}".encode()).hexdigest()[:10]
     else:
-        key = hashlib.md5(f"{tag}_{model_name}_{architecture}_{max_length}_{pooling}_{layer}".encode()).hexdigest()[:10]
+        key = hashlib.md5(f"{tag}_{model_name}_{architecture}_{max_length}_{pooling}_{layer}{suffix}".encode()).hexdigest()[:10]
     return Path(cache_dir) / f"{key}.npy"
 
 
-def load_or_extract(texts, tag, model_name, architecture, pooling, layer, max_length, cache_dir, recompute, log):
+def load_or_extract(texts, tag, model_name, architecture, pooling, layer, max_length, cache_dir,
+                     recompute, log, load_in_4bit=False, batch_size=16):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_path_for(cache_dir, tag, model_name, architecture, max_length, pooling, layer)
+    path = cache_path_for(cache_dir, tag, model_name, architecture, max_length, pooling, layer,
+                           load_in_4bit)
     if path.exists() and not recompute:
         log(f"loading cached [{tag}] {model_name} L{layer} ({pooling}) -> {path.name}")
         return np.load(path)
-    log(f"extracting [{tag}] {model_name} L{layer} ({pooling}) for {len(texts)} rows...")
+    log(f"extracting [{tag}] {model_name} L{layer} ({pooling}) for {len(texts)} rows "
+        f"(4bit={load_in_4bit}, batch_size={batch_size})...")
     emb = extract_decoder_embeddings(
         model_name, texts, max_length=max_length, pooling=pooling,
-        layers=(layer,), architecture=architecture, log=log,
+        layers=(layer,), architecture=architecture, log=log, load_in_4bit=load_in_4bit,
+        batch_size=batch_size,
     )[layer]
     np.save(path, emb)
     return emb
@@ -98,13 +106,22 @@ def load_external_data(paths, cap_per_class, label2id, log):
         edf = edf[edf["model"].isin(label2id)].copy()
         if len(edf) < before:
             log(f"{p}: dropped {before - len(edf)} rows with unknown model labels")
-        frames.append(edf[["text", "model"]])
+        cols = ["text", "model"] + (["match_weight"] if "match_weight" in edf.columns else [])
+        frames.append(edf[cols])
     ext_df = pd.concat(frames, ignore_index=True)
     if cap_per_class is not None:
+        # name-that-llm-open-pool's own ablation: sampling weighted by match_weight (matches
+        # each row's typography/length to real train passages) gave +0.026 balanced accuracy
+        # alone vs uniform sampling -- use it when the source provides it.
+        def sample_group(g):
+            n = min(len(g), cap_per_class)
+            if "match_weight" in g.columns and g["match_weight"].notna().any():
+                weights = g["match_weight"].fillna(1.0).clip(lower=1e-6)
+                return g.sample(n=n, weights=weights, random_state=0)
+            return g.sample(n=n, random_state=0)
+
         ext_df = (
-            ext_df.groupby("model", group_keys=False)
-            .apply(lambda g: g.sample(n=min(len(g), cap_per_class), random_state=0))
-            .reset_index(drop=True)
+            ext_df.groupby("model", group_keys=False).apply(sample_group).reset_index(drop=True)
         )
     log(f"external data: {len(ext_df)} rows after cap={cap_per_class}/class\n{ext_df['model'].value_counts()}")
     return ext_df
